@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: sizehunt_pg
+    restart: always
+    environment:
+      POSTGRES_USER: sizehunt
+      POSTGRES_PASSWORD: sizehunt
+      POSTGRES_DB: sizehunt
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  migrate:
+    image: migrate/migrate:latest
+    depends_on:
+      - postgres
+    volumes:
+      - ./migrations:/migrations
+    entrypoint: ["migrate"]
+    command:
+      [
+        "-path", "/migrations",
+        "-database", "postgres://sizehunt:sizehunt@postgres:5432/sizehunt?sslmode=disable",
+        "up"
+      ]
+
+
+volumes:
+  postgres_data:
