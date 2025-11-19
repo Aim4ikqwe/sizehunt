@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"sizehunt/internal/binance/repository"
 	"sizehunt/internal/config"
+	subscriptionservice "sizehunt/internal/subscription/service"
 	"sync"
 )
 
@@ -10,15 +12,15 @@ type WebSocketManager struct {
 	watchers            map[string]*WebSocketWatcher // symbol_market -> watcher
 	mu                  sync.RWMutex
 	ctx                 context.Context
-	subscriptionService interface{} // subscription.Service
-	keysRepo            interface{} // repository.PostgresKeysRepo
+	subscriptionService *subscriptionservice.Service
+	keysRepo            *repository.PostgresKeysRepo
 	config              *config.Config
 }
 
 func NewWebSocketManager(
 	ctx context.Context,
-	subService interface{}, // subscription.Service
-	keysRepo interface{}, // repository.PostgresKeysRepo
+	subService *subscriptionservice.Service,
+	keysRepo *repository.PostgresKeysRepo,
 	cfg *config.Config,
 ) *WebSocketManager {
 	return &WebSocketManager{
