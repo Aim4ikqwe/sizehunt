@@ -16,6 +16,7 @@ type APIKeys struct {
 type KeysRepository interface {
 	SaveKeys(userID int64, apiKey, secretKey string) error
 	GetKeys(userID int64) (*APIKeys, error)
+	DeleteByUserID(ctx context.Context, userID int64) error
 }
 
 // PostgresKeysRepo — реализация KeysRepository для PostgreSQL
@@ -52,4 +53,12 @@ func (r *PostgresKeysRepo) GetKeys(userID int64) (*APIKeys, error) {
 		APIKey:    apiKey,
 		SecretKey: secretKey,
 	}, nil
+}
+
+// Добавь метод в PostgresKeysRepo:
+func (r *PostgresKeysRepo) DeleteByUserID(ctx context.Context, userID int64) error {
+	_, err := r.DB.ExecContext(ctx,
+		`DELETE FROM binance_keys WHERE user_id = $1`,
+		userID)
+	return err
 }

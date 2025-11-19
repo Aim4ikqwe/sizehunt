@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -8,9 +9,15 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
 
+	"sizehunt/internal/binance/repository"
+	binance_service "sizehunt/internal/binance/service"
+	binancehttp "sizehunt/internal/binance/transport/http"
 	"sizehunt/internal/config"
-	"sizehunt/internal/user/repository"
-	"sizehunt/internal/user/service"
+	subscriptionrepository "sizehunt/internal/subscription/repository"
+	subscriptionservice "sizehunt/internal/subscription/service"
+	tokenrepository "sizehunt/internal/token/repository"
+	userrepository "sizehunt/internal/user/repository"
+	userservice "sizehunt/internal/user/service"
 	userhttp "sizehunt/internal/user/transport/http"
 	"sizehunt/pkg/db"
 	"sizehunt/pkg/middleware"
@@ -30,9 +37,31 @@ func main() {
 	fmt.Println("Connected to PostgreSQL")
 
 	// --- ИНИЦИАЛИЗАЦИЯ СЛОЁВ ---
-	userRepo := repository.NewPostgresUserRepository(database)
-	userService := service.NewUserService(userRepo)
-	h := userhttp.NewHandler(userService, cfg.JWTSecret)
+	userRepo := userrepository.NewPostgresUserRepository(database)
+	userService := userservice.NewUserService(userRepo)
+
+	refreshTokenRepo := tokenrepository.NewRefreshTokenRepository(database)
+
+	h := userhttp.NewHandler(userService, cfg.JWTSecret, refreshTokenRepo)
+
+	// Binance
+	keysRepo := repository.NewPostgresKeysRepo(database)
+	binanceClient := binance_service.NewBinanceHTTPClient("temp")
+	binanceWatcher := binance_service.NewWatcher(binanceClient)
+
+	// Subscription
+	subRepo := subscriptionrepository.NewSubscriptionRepository(database)
+	subService := subscriptionservice.NewService(subRepo)
+
+	// WebSocket Manager
+	wsManager := binance_service.NewWebSocketManager(
+		context.Background(),
+		subService,
+		keysRepo,
+		cfg,
+	)
+
+	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager)
 
 	// --- РОУТЕР ---
 	r := chi.NewRouter()
@@ -50,6 +79,7 @@ func main() {
 	// Публичные роуты
 	r.Post("/auth/register", h.Register)
 	r.Post("/auth/login", h.Login)
+	r.Post("/auth/refresh", h.Refresh)
 
 	// 🔐 Защищённая группа маршрутов
 	r.Group(func(pr chi.Router) {
@@ -59,6 +89,12 @@ func main() {
 			id := r.Context().Value(middleware.UserIDKey).(int64)
 			w.Write([]byte(fmt.Sprintf("Your user ID: %d", id)))
 		})
+
+		// Binance routes
+		pr.Get("/api/binance/book", binanceHandler.GetOrderBook)
+		pr.Post("/api/binance/keys", binanceHandler.SaveKeys)
+		pr.Delete("/api/binance/keys", binanceHandler.DeleteKeys)
+		pr.Post("/api/binance/signal", binanceHandler.CreateSignal)
 	})
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
