@@ -13,19 +13,18 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
   migrate:
-    image: migrate/migrate:latest
+    image: migrate/migrate:v4.15.2
     depends_on:
       - postgres
     volumes:
       - ./migrations:/migrations
     entrypoint: ["migrate"]
     command:
-      [
-        "-path", "/migrations",
-        "-database", "postgres://sizehunt:sizehunt@postgres:5432/sizehunt?sslmode=disable",
-        "up"
-      ]
-
+      - "-source"
+      - "file:///migrations"
+      - "-database"
+      - "postgres://sizehunt:sizehunt@postgres:5432/sizehunt?sslmode=disable"
+      - "up"
 
 volumes:
   postgres_data:

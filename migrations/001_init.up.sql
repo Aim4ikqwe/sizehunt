@@ -6,10 +6,10 @@ CREATE TABLE IF NOT EXISTS users (
                                      created_at TIMESTAMP DEFAULT NOW()
     );
 
--- Логи (на будущее)
+-- Создание таблицы логов
 CREATE TABLE IF NOT EXISTS logs (
                                     id SERIAL PRIMARY KEY,
-                                    user_id INT REFERENCES users(id),
+                                    user_id INT REFERENCES users(id) ON DELETE CASCADE,
     action TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT NOW()
     );
