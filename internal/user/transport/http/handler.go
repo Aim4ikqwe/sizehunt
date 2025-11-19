@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"sizehunt/internal/api/dto"
 	"sizehunt/internal/user/service"
 )
 
@@ -19,15 +20,15 @@ func NewHandler(us *service.UserService, jwtSecret string) *Handler {
 	}
 }
 
-type requestUser struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-}
-
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
-	var req requestUser
+	var req dto.RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if err := dto.Validate.Struct(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -47,9 +48,14 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
-	var req requestUser
+	var req dto.LoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if err := dto.Validate.Struct(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -59,7 +65,6 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Генерация JWT
 	token, err := h.JWT.Generate(u.ID, u.Email)
 	if err != nil {
 		http.Error(w, "token error", http.StatusInternalServerError)

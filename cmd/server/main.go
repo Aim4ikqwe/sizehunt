@@ -6,11 +6,12 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/cors"
 
 	"sizehunt/internal/config"
 	"sizehunt/internal/user/repository"
 	"sizehunt/internal/user/service"
-	userhttp "sizehunt/internal/user/transport/http" // алиас!
+	userhttp "sizehunt/internal/user/transport/http"
 	"sizehunt/pkg/db"
 	"sizehunt/pkg/middleware"
 )
@@ -35,6 +36,16 @@ func main() {
 
 	// --- РОУТЕР ---
 	r := chi.NewRouter()
+
+	// CORS
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"https://localhost:3000", "http://localhost:3000", "http://localhost:5173"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
 
 	// Публичные роуты
 	r.Post("/auth/register", h.Register)
