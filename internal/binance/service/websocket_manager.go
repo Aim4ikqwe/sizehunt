@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"log"
 	"sizehunt/internal/binance/repository"
 	"sizehunt/internal/config"
 	subscriptionservice "sizehunt/internal/subscription/service"
@@ -39,14 +40,18 @@ func (m *WebSocketManager) GetOrCreateWatcher(symbol string, market string) (*We
 	key := symbol + "_" + market
 
 	if w, ok := m.watchers[key]; ok {
+		log.Printf("WebSocketManager: Reusing existing watcher for %s", key)
 		return w, nil
 	}
 
+	log.Printf("WebSocketManager: Creating new watcher for %s", key)
 	w := NewWebSocketWatcher(m.subscriptionService, m.keysRepo, m.config)
 	if err := w.Start(m.ctx, symbol, market); err != nil {
+		log.Printf("WebSocketManager: Failed to start watcher for %s: %v", key, err)
 		return nil, err
 	}
 
 	m.watchers[key] = w
+	log.Printf("WebSocketManager: Started watcher for %s", key)
 	return w, nil
 }

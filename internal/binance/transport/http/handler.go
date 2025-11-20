@@ -2,30 +2,42 @@ package http
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
 
 	"sizehunt/internal/api/dto"
+	"sizehunt/internal/binance/entity"
 	"sizehunt/internal/binance/repository"
 	"sizehunt/internal/binance/service"
 	"sizehunt/internal/config"
+	subscriptionservice "sizehunt/internal/subscription/service"
 	"sizehunt/pkg/middleware"
 )
 
 type Handler struct {
-	BinanceService   *service.Watcher
-	KeysRepo         *repository.PostgresKeysRepo
-	Config           *config.Config
-	WebSocketManager *service.WebSocketManager
+	BinanceService      *service.Watcher
+	KeysRepo            *repository.PostgresKeysRepo
+	Config              *config.Config
+	WebSocketManager    *service.WebSocketManager
+	SubscriptionService *subscriptionservice.Service // добавь
 }
 
-func NewBinanceHandler(watcher *service.Watcher, keysRepo *repository.PostgresKeysRepo, cfg *config.Config, wsManager *service.WebSocketManager) *Handler {
+func NewBinanceHandler(
+	watcher *service.Watcher,
+	keysRepo *repository.PostgresKeysRepo,
+	cfg *config.Config,
+	wsManager *service.WebSocketManager,
+	subService *subscriptionservice.Service, // добавь
+) *Handler {
 	return &Handler{
-		BinanceService:   watcher,
-		KeysRepo:         keysRepo,
-		Config:           cfg,
-		WebSocketManager: wsManager,
+		BinanceService:      watcher,
+		KeysRepo:            keysRepo,
+		Config:              cfg,
+		WebSocketManager:    wsManager,
+		SubscriptionService: subService, // добавь
 	}
 }
 
@@ -134,9 +146,12 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("Handler: CreateSignal called for user %d, symbol %s, price %.8f", userID, req.Symbol, req.TargetPrice)
+
 	// Получаем WebSocketWatcher
 	watcher, err := h.WebSocketManager.GetOrCreateWatcher(req.Symbol, req.Market)
 	if err != nil {
+		log.Printf("Handler: Failed to get or create watcher for %s: %v", req.Symbol, err)
 		http.Error(w, "failed to create watcher", http.StatusInternalServerError)
 		return
 	}
@@ -153,10 +168,107 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		AutoClose:       req.AutoClose, // добавь
 	}
 
+	log.Printf("Handler: Adding signal %d to watcher for user %d, symbol %s", signal.ID, signal.UserID, signal.Symbol)
 	watcher.AddSignal(signal)
 
+	log.Printf("Handler: Signal %d created successfully for user %d", signal.ID, userID)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"message":"signal created"}`))
+}
+
+func (h *Handler) GetOrderAtPrice(w http.ResponseWriter, r *http.Request) {
+	symbol := r.URL.Query().Get("symbol")
+	priceStr := r.URL.Query().Get("price")
+	market := r.URL.Query().Get("market") // "spot" или "futures"
+
+	if symbol == "" || priceStr == "" {
+		http.Error(w, "symbol and price are required", http.StatusBadRequest)
+		return
+	}
+
+	price, err := strconv.ParseFloat(priceStr, 64)
+	if err != nil {
+		http.Error(w, "invalid price", http.StatusBadRequest)
+		return
+	}
+
+	if market == "" {
+		market = "futures" // по умолчанию
+	}
+
+	// Получаем userID
+	userID := r.Context().Value(middleware.UserIDKey).(int64)
+
+	// Проверяем подписку
+	subscribed, err := h.SubscriptionService.IsUserSubscribed(r.Context(), userID)
+	if err != nil {
+		http.Error(w, "failed to check subscription", http.StatusInternalServerError)
+		return
+	}
+	if !subscribed {
+		http.Error(w, "subscription required", http.StatusForbidden)
+		return
+	}
+
+	// Получаем API-ключи
+	keys, err := h.KeysRepo.GetKeys(userID)
+	if err != nil {
+		http.Error(w, "API keys not found", http.StatusUnauthorized)
+		return
+	}
+
+	secret := h.Config.EncryptionSecret
+	apiKey, err := service.DecryptAES(keys.APIKey, secret)
+	if err != nil {
+		http.Error(w, "failed to decrypt API key", http.StatusInternalServerError)
+		return
+	}
+
+	// Получаем ордербук
+	client := service.NewBinanceHTTPClient(apiKey)
+	ob, err := client.GetOrderBook(symbol, 1000, market) // 1000 — максимум
+	if err != nil {
+		http.Error(w, "failed to get order book", http.StatusInternalServerError)
+		return
+	}
+
+	// Ищем заявку на нужной цене
+	var foundOrder *entity.Order
+	for _, bid := range ob.Bids {
+		if bid.Price == price {
+			foundOrder = &bid
+			break
+		}
+	}
+
+	if foundOrder == nil {
+		for _, ask := range ob.Asks {
+			if ask.Price == price {
+				foundOrder = &ask
+				break
+			}
+		}
+	}
+
+	if foundOrder == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"price":      price,
+			"is_present": false,
+			"message":    "no order found at this price",
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"price":      foundOrder.Price,
+		"is_present": true,
+		"quantity":   foundOrder.Quantity,
+		"side":       foundOrder.Side,
+	})
+	log.Printf("Get order at price %s with price %s", price, foundOrder.Price)
+	fmt.Printf("Geto order at price %s with price %s\n", price, foundOrder.Price)
 }
 
 // generateID — генератор ID (можно использовать UUID или просто счётчик)

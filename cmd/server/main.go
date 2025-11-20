@@ -15,6 +15,7 @@ import (
 	"sizehunt/internal/config"
 	subscriptionrepository "sizehunt/internal/subscription/repository"
 	subscriptionservice "sizehunt/internal/subscription/service"
+	subscriptionhttp "sizehunt/internal/subscription/transport/http"
 	tokenrepository "sizehunt/internal/token/repository"
 	userrepository "sizehunt/internal/user/repository"
 	userservice "sizehunt/internal/user/service"
@@ -34,6 +35,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Database connection failed: %v", err)
 	}
+	log.Println("Database connected")
 	fmt.Println("Connected to PostgreSQL")
 
 	// --- ИНИЦИАЛИЗАЦИЯ СЛОЁВ ---
@@ -61,7 +63,11 @@ func main() {
 		cfg,
 	)
 
-	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager)
+	// Binance Handler (обновлённый)
+	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager, subService)
+
+	// Subscription Handler
+	subHandler := subscriptionhttp.NewSubscriptionHandler(subService)
 
 	// --- РОУТЕР ---
 	r := chi.NewRouter()
@@ -92,9 +98,14 @@ func main() {
 
 		// Binance routes
 		pr.Get("/api/binance/book", binanceHandler.GetOrderBook)
+		pr.Get("/api/binance/order-at-price", binanceHandler.GetOrderAtPrice) // добавь
 		pr.Post("/api/binance/keys", binanceHandler.SaveKeys)
 		pr.Delete("/api/binance/keys", binanceHandler.DeleteKeys)
 		pr.Post("/api/binance/signal", binanceHandler.CreateSignal)
+
+		// Payment routes
+		pr.Post("/api/payment/create", subHandler.CreatePayment)
+		pr.Post("/api/payment/webhook", subHandler.Webhook)
 	})
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {

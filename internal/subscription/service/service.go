@@ -3,7 +3,7 @@ package service
 import (
 	"context"
 	"sizehunt/internal/subscription"
-	"time"
+	"time" // <--- добавь
 )
 
 type SubscriptionRepository interface {
