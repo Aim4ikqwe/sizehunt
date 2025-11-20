@@ -1,14 +1,13 @@
+// cmd/server/main.go
 package main
 
 import (
 	"context"
 	"fmt"
-	"log"
-	"net/http"
-
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
-
+	"log"
+	"net/http"
 	"sizehunt/internal/binance/repository"
 	binance_service "sizehunt/internal/binance/service"
 	binancehttp "sizehunt/internal/binance/transport/http"
@@ -26,11 +25,9 @@ import (
 
 func main() {
 	fmt.Println("SizeHunt API starting...")
-
 	cfg := config.Load()
 	fmt.Println("Config loaded")
 
-	// Подключение к БД
 	database, err := db.Connect(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("Database connection failed: %v", err)
@@ -41,21 +38,17 @@ func main() {
 	// --- ИНИЦИАЛИЗАЦИЯ СЛОЁВ ---
 	userRepo := userrepository.NewPostgresUserRepository(database)
 	userService := userservice.NewUserService(userRepo)
-
 	refreshTokenRepo := tokenrepository.NewRefreshTokenRepository(database)
-
 	h := userhttp.NewHandler(userService, cfg.JWTSecret, refreshTokenRepo)
 
 	// Binance
 	keysRepo := repository.NewPostgresKeysRepo(database)
-	binanceClient := binance_service.NewBinanceHTTPClient("temp")
+	binanceClient := binance_service.NewBinanceHTTPClient("", "") // Инициализируем без ключей
 	binanceWatcher := binance_service.NewWatcher(binanceClient)
 
-	// Subscription
 	subRepo := subscriptionrepository.NewSubscriptionRepository(database)
 	subService := subscriptionservice.NewService(subRepo)
 
-	// WebSocket Manager
 	wsManager := binance_service.NewWebSocketManager(
 		context.Background(),
 		subService,
@@ -63,10 +56,7 @@ func main() {
 		cfg,
 	)
 
-	// Binance Handler (обновлённый)
 	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager, subService)
-
-	// Subscription Handler
 	subHandler := subscriptionhttp.NewSubscriptionHandler(subService)
 
 	// --- РОУТЕР ---
@@ -90,7 +80,6 @@ func main() {
 	// 🔐 Защищённая группа маршрутов
 	r.Group(func(pr chi.Router) {
 		pr.Use(middleware.JWTAuth(cfg.JWTSecret))
-
 		pr.Get("/auth/me", func(w http.ResponseWriter, r *http.Request) {
 			id := r.Context().Value(middleware.UserIDKey).(int64)
 			w.Write([]byte(fmt.Sprintf("Your user ID: %d", id)))

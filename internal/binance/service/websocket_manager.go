@@ -1,8 +1,9 @@
+// internal/binance/service/websocket_manager.go
 package service
 
 import (
 	"context"
-	"log"
+	"fmt"
 	"sizehunt/internal/binance/repository"
 	"sizehunt/internal/config"
 	subscriptionservice "sizehunt/internal/subscription/service"
@@ -10,12 +11,12 @@ import (
 )
 
 type WebSocketManager struct {
-	watchers            map[string]*WebSocketWatcher // symbol_market -> watcher
-	mu                  sync.RWMutex
-	ctx                 context.Context
-	subscriptionService *subscriptionservice.Service
-	keysRepo            *repository.PostgresKeysRepo
-	config              *config.Config
+	spotWatcher    *MarketDepthWatcher
+	futuresWatcher *MarketDepthWatcher
+	mu             sync.RWMutex
+	subService     *subscriptionservice.Service
+	keysRepo       *repository.PostgresKeysRepo
+	cfg            *config.Config
 }
 
 func NewWebSocketManager(
@@ -24,34 +25,32 @@ func NewWebSocketManager(
 	keysRepo *repository.PostgresKeysRepo,
 	cfg *config.Config,
 ) *WebSocketManager {
-	return &WebSocketManager{
-		watchers:            make(map[string]*WebSocketWatcher),
-		ctx:                 ctx,
-		subscriptionService: subService,
-		keysRepo:            keysRepo,
-		config:              cfg,
+	manager := &WebSocketManager{
+		subService: subService,
+		keysRepo:   keysRepo,
+		cfg:        cfg,
 	}
+
+	// Создаём watchers для каждого рынка, передавая контекст
+	manager.spotWatcher = NewMarketDepthWatcher(ctx, "spot", subService, keysRepo, cfg)
+	manager.futuresWatcher = NewMarketDepthWatcher(ctx, "futures", subService, keysRepo, cfg)
+
+	// Запуск больше не происходит здесь автоматически при создании.
+	// Он инициируется при добавлении первого сигнала в watcher через AddSignal.
+
+	return manager
 }
 
-func (m *WebSocketManager) GetOrCreateWatcher(symbol string, market string) (*WebSocketWatcher, error) {
+func (m *WebSocketManager) GetOrCreateWatcher(symbol string, market string) (*MarketDepthWatcher, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	key := symbol + "_" + market
-
-	if w, ok := m.watchers[key]; ok {
-		log.Printf("WebSocketManager: Reusing existing watcher for %s", key)
-		return w, nil
+	switch market {
+	case "spot":
+		return m.spotWatcher, nil
+	case "futures":
+		return m.futuresWatcher, nil
+	default:
+		return nil, fmt.Errorf("unsupported market: %s", market)
 	}
-
-	log.Printf("WebSocketManager: Creating new watcher for %s", key)
-	w := NewWebSocketWatcher(m.subscriptionService, m.keysRepo, m.config)
-	if err := w.Start(m.ctx, symbol, market); err != nil {
-		log.Printf("WebSocketManager: Failed to start watcher for %s: %v", key, err)
-		return nil, err
-	}
-
-	m.watchers[key] = w
-	log.Printf("WebSocketManager: Started watcher for %s", key)
-	return w, nil
 }

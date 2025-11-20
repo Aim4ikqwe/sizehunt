@@ -1,3 +1,4 @@
+// internal/api/dto/user.go
 package dto
 
 import "github.com/go-playground/validator/v10"
@@ -24,7 +25,8 @@ type CreateSignalRequest struct {
 	TriggerOnCancel bool    `json:"trigger_on_cancel"`
 	TriggerOnEat    bool    `json:"trigger_on_eat"`
 	EatPercentage   float64 `json:"eat_percentage"` // 0.5 = 50%
-	Market          string  `json:"market"`         // "spot" или "futures"
+	Market          string  `json:"market"`         // "spot" или "futures" - где мониторить
+	CloseMarket     string  `json:"close_market"`   // "spot" или "futures" - где закрывать
 	AutoClose       bool    `json:"auto_close"`     // закрыть позицию при срабатывании
 }
 

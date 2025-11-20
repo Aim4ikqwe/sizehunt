@@ -1,81 +1,146 @@
+// internal/binance/service/websocket_client.go
 package service
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
+	"github.com/adshao/go-binance/v2"
+	"github.com/adshao/go-binance/v2/futures"
 	"log"
-
-	"github.com/gorilla/websocket"
 )
 
+// UnifiedDepthStreamData объединяет данные из разных рынков
+type UnifiedDepthStreamData struct {
+	Stream string
+	Data   *UnifiedDepthEvent
+}
+
+// UnifiedDepthEvent объединяет структуры данных для спота и фьючерсов
+type UnifiedDepthEvent struct {
+	Symbol        string
+	FirstUpdateID int64
+	LastUpdateID  int64
+	Bids          [][]string // [][price, quantity]
+	Asks          [][]string // [][price, quantity]
+}
+
 type WebSocketClient struct {
-	conn   *websocket.Conn
-	URL    string
-	OnData func(data *DepthStreamData)
+	OnData func(data *UnifiedDepthStreamData)
+	stopC  chan struct{}
+	doneC  <-chan struct{}
 }
 
-type DepthStreamData struct {
-	Stream string      `json:"stream"`
-	Data   DepthUpdate `json:"data"`
+func NewWebSocketClient() *WebSocketClient {
+	return &WebSocketClient{}
 }
 
-type DepthUpdate struct {
-	EventType     string     `json:"e"`
-	EventTime     int64      `json:"E"`
-	Symbol        string     `json:"s"`
-	FirstUpdateID int64      `json:"U"`
-	LastUpdateID  int64      `json:"u"`
-	Bids          [][]string `json:"b"`
-	Asks          [][]string `json:"a"`
-}
-
-func NewWebSocketClient(url string) *WebSocketClient {
-	return &WebSocketClient{
-		URL: url,
-	}
-}
-
-func (w *WebSocketClient) Connect(ctx context.Context) error {
-	conn, _, err := websocket.DefaultDialer.Dial(w.URL, nil)
-	if err != nil {
-		return err
-	}
-	w.conn = conn
-
-	go w.readLoop(ctx)
-	return nil
-}
-
-func (w *WebSocketClient) readLoop(ctx context.Context) {
-	defer w.conn.Close()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			_, message, err := w.conn.ReadMessage()
-			if err != nil {
-				log.Println("WebSocket read error:", err)
-				return
-			}
-
-			var data DepthStreamData
-			if err := json.Unmarshal(message, &data); err != nil {
-				log.Println("Failed to unmarshal depth data:", err)
-				continue
-			}
-
-			if w.OnData != nil {
-				w.OnData(&data)
-			}
+// ConnectForSpotCombined использует binance.WsCombinedDepthServe для нескольких спотовых символов
+func (w *WebSocketClient) ConnectForSpotCombined(ctx context.Context, symbols []string) error {
+	doneC, stopC, err := binance.WsCombinedDepthServe(symbols, func(event *binance.WsDepthEvent) {
+		// Конвертируем spot событие в унифицированное
+		// Преобразуем []binance.Bid/Ask в [][]string
+		bids := make([][]string, len(event.Bids))
+		for i, bid := range event.Bids {
+			bids[i] = []string{bid.Price, bid.Quantity}
 		}
+		asks := make([][]string, len(event.Asks))
+		for i, ask := range event.Asks {
+			asks[i] = []string{ask.Price, ask.Quantity}
+		}
+		unifiedEvent := &UnifiedDepthEvent{
+			Symbol:        event.Symbol,
+			FirstUpdateID: event.FirstUpdateID,
+			LastUpdateID:  event.LastUpdateID,
+			Bids:          bids,
+			Asks:          asks,
+		}
+		streamData := &UnifiedDepthStreamData{
+			Stream: fmt.Sprintf("%s@depth", event.Symbol),
+			Data:   unifiedEvent,
+		}
+		if w.OnData != nil {
+			w.OnData(streamData)
+		}
+	}, func(err error) {
+		log.Printf("WebSocket error for spot combined stream: %v", err)
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to connect to spot combined WebSocket: %w", err)
 	}
+
+	w.doneC = doneC
+	w.stopC = stopC
+
+	// Горутина для остановки по контексту
+	go func() {
+		<-ctx.Done()
+		log.Printf("Context cancelled, stopping combined WebSocket for spot")
+		if w.stopC != nil {
+			close(w.stopC)
+		}
+	}()
+
+	return nil
 }
 
-func (w *WebSocketClient) Close() error {
-	if w.conn != nil {
-		return w.conn.Close()
+// ConnectForFuturesCombined использует futures.WsCombinedDepthServe для нескольких фьючерсных символов
+func (w *WebSocketClient) ConnectForFuturesCombined(ctx context.Context, symbolLevels map[string]string) error {
+	doneC, stopC, err := futures.WsCombinedDepthServe(symbolLevels, func(event *futures.WsDepthEvent) {
+		// Конвертируем futures событие в унифицированное
+		// Преобразуем []futures.Bid/Ask в [][]string
+		bids := make([][]string, len(event.Bids))
+		for i, bid := range event.Bids {
+			bids[i] = []string{bid.Price, bid.Quantity}
+		}
+		asks := make([][]string, len(event.Asks))
+		for i, ask := range event.Asks {
+			asks[i] = []string{ask.Price, ask.Quantity}
+		}
+		unifiedEvent := &UnifiedDepthEvent{
+			Symbol:        event.Symbol,
+			FirstUpdateID: event.FirstUpdateID,
+			LastUpdateID:  event.LastUpdateID,
+			Bids:          bids,
+			Asks:          asks,
+		}
+		streamData := &UnifiedDepthStreamData{
+			Stream: fmt.Sprintf("%s@depth", event.Symbol),
+			Data:   unifiedEvent,
+		}
+		if w.OnData != nil {
+			w.OnData(streamData)
+		}
+	}, func(err error) {
+		log.Printf("WebSocket error for futures combined stream: %v", err)
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to connect to futures combined WebSocket: %w", err)
 	}
+
+	w.doneC = doneC
+	w.stopC = stopC
+
+	// Горутина для остановки по контексту
+	go func() {
+		<-ctx.Done()
+		log.Printf("Context cancelled, stopping combined WebSocket for futures")
+		if w.stopC != nil {
+			close(w.stopC)
+		}
+	}()
+
 	return nil
+}
+
+// Close закрывает соединение
+func (w *WebSocketClient) Close() {
+	if w.stopC != nil {
+		close(w.stopC)
+	}
+	if w.doneC != nil {
+		<-w.doneC
+		log.Println("Combined WebSocket connection closed.")
+	}
 }

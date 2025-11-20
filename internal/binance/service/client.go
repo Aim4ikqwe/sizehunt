@@ -1,3 +1,4 @@
+// internal/binance/service/client.go
 package service
 
 import "sizehunt/internal/binance/entity"

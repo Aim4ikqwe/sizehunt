@@ -1,3 +1,4 @@
+// internal/binance/service/watcher.go
 package service
 
 import (
@@ -18,23 +19,19 @@ func (w *Watcher) DetectLargeOrder(symbol string, price float64, minQty float64,
 	if limit > 3000 {
 		limit = 3000
 	}
-
 	book, err := w.client.GetOrderBook(symbol, limit, market)
 	if err != nil {
 		return nil, err
 	}
-
 	for _, o := range book.Bids {
 		if o.Price == price && o.Quantity >= minQty {
 			return &o, nil
 		}
 	}
-
 	for _, o := range book.Asks {
 		if o.Price == price && o.Quantity >= minQty {
 			return &o, nil
 		}
 	}
-
 	return nil, errors.New("order not found")
 }

@@ -1,91 +1,74 @@
+// internal/binance/service/order_manager.go
 package service
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"fmt"
-	"io"
+	"github.com/adshao/go-binance/v2"
+	"github.com/adshao/go-binance/v2/futures"
 	"log"
-	"net/http"
-	"net/url"
-	"time"
 )
 
 type OrderManager struct {
-	APIKey    string
-	SecretKey string
-	BaseURL   string
+	SpotClient    *binance.Client
+	FuturesClient *futures.Client
 }
 
-func NewOrderManager(apiKey, secretKey, baseURL string) *OrderManager {
+func NewOrderManager(apiKey, secretKey string) *OrderManager {
+	// Инициализируем оба клиента
+	spotClient := binance.NewClient(apiKey, secretKey)
+	futuresClient := binance.NewFuturesClient(apiKey, secretKey)
 	return &OrderManager{
-		APIKey:    apiKey,
-		SecretKey: secretKey,
-		BaseURL:   baseURL,
+		SpotClient:    spotClient,
+		FuturesClient: futuresClient,
 	}
 }
 
-type ClosePositionRequest struct {
-	Symbol   string `json:"symbol"`
-	Side     string `json:"side"` // "BUY" or "SELL"
-	Type     string `json:"type"` // "MARKET"
-	Quantity string `json:"quantity"`
+func (om *OrderManager) ClosePosition(symbol, side, quantity string, market string) error {
+	log.Printf("OrderManager: ClosePosition called for symbol %s, side %s, quantity %s, market %s", symbol, side, quantity, market)
+
+	switch market {
+	case "futures":
+		return om.closeFuturesPosition(symbol, side, quantity)
+	case "spot":
+		return om.closeSpotPosition(symbol, side, quantity)
+	default:
+		return fmt.Errorf("unsupported market for closing: %s", market)
+	}
 }
 
-func (om *OrderManager) ClosePosition(symbol, side, quantity string) error {
-	log.Printf("OrderManager: ClosePosition called for symbol %s, side %s, quantity %s", symbol, side, quantity)
-
-	endpoint := fmt.Sprintf("%s/fapi/v1/order", om.BaseURL)
-
-	params := url.Values{}
-	params.Add("symbol", symbol)
-	params.Add("side", side)
-	params.Add("type", "MARKET")
-	params.Add("quantity", quantity)
-	params.Add("timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
-
-	// Генерация подписи
-	signature := om.generateSignature(params.Encode())
-	params.Add("signature", signature)
-
-	reqURL := endpoint + "?" + params.Encode()
-
-	log.Printf("OrderManager: Sending request to %s with params: %s", reqURL, params.Encode())
-
-	req, err := http.NewRequest("POST", reqURL, nil)
+func (om *OrderManager) closeFuturesPosition(symbol, side, quantity string) error {
+	// Используем библиотеку для фьючерсов
+	service := om.FuturesClient.NewCreateOrderService()
+	service.Symbol(symbol)
+	service.Side(futures.SideType(side)) // Преобразуем строку в тип
+	service.Type(futures.OrderTypeMarket)
+	service.Quantity(quantity)
+	// service.Timestamp(time.Now().UnixMilli()) // <--- УДАЛЕНО
+	// Подпись и выполнение
+	_, err := service.Do(context.Background())
 	if err != nil {
-		log.Printf("OrderManager: Failed to create request: %v", err)
-		return err
+		log.Printf("OrderManager: Binance Futures API error: %v", err)
+		return fmt.Errorf("Binance Futures API error: %w", err)
 	}
-
-	req.Header.Set("X-MBX-APIKEY", om.APIKey)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("OrderManager: Failed to send request: %v", err)
-		return err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("OrderManager: Binance API error: %s (status: %d)", string(body), resp.StatusCode)
-		return fmt.Errorf("Binance API error: %s", string(body))
-	}
-
-	log.Printf("OrderManager: Position closed successfully for symbol %s, response: %s", symbol, string(body))
+	log.Printf("OrderManager: Futures position closed successfully for symbol %s", symbol)
 	return nil
 }
 
-func (om *OrderManager) generateSignature(message string) string {
-	log.Printf("OrderManager: Generating signature for message: %s", message)
-	key := []byte(om.SecretKey)
-	h := hmac.New(sha256.New, key)
-	h.Write([]byte(message))
-	signature := hex.EncodeToString(h.Sum(nil))
-	log.Printf("OrderManager: Generated signature: %s", signature)
-	return signature
+func (om *OrderManager) closeSpotPosition(symbol, side, quantity string) error {
+	// Используем библиотеку для спота
+	service := om.SpotClient.NewCreateOrderService()
+	service.Symbol(symbol)
+	service.Side(binance.SideType(side)) // Преобразуем строку в тип
+	service.Type(binance.OrderTypeMarket)
+	service.Quantity(quantity)
+	// service.Timestamp(time.Now().UnixMilli()) // <--- УДАЛЕНО (если было)
+	// Подпись и выполнение
+	_, err := service.Do(context.Background())
+	if err != nil {
+		log.Printf("OrderManager: Binance Spot API error: %v", err)
+		return fmt.Errorf("Binance Spot API error: %w", err)
+	}
+	log.Printf("OrderManager: Spot position closed successfully for symbol %s", symbol)
+	return nil
 }
