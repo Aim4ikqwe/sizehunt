@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"strconv"
+	"time"
 
 	"github.com/adshao/go-binance/v2"
 	"github.com/adshao/go-binance/v2/futures"
@@ -77,10 +78,13 @@ func (om *OrderManager) closeFuturesPosition(symbol, side, quantity string) erro
 func (om *OrderManager) closeFullFuturesPosition(symbol string) error {
 	// Шаг 1: Получить текущую позицию
 	log.Printf("OrderManager: closeFullFuturesPosition: Fetching current position for %s", symbol)
+	startGetPositionTime := time.Now()
 	service := om.FuturesClient.NewGetPositionRiskService() // Используем существующий клиент
 	service.Symbol(symbol)
 
 	positions, err := service.Do(context.Background())
+	getPositionDuration := time.Since(startGetPositionTime)
+	log.Printf("OrderManager: GetPositionRisk API call for %s took %v", symbol, getPositionDuration)
 	if err != nil {
 		log.Printf("OrderManager: closeFullFuturesPosition: GetPositionRisk API error for %s: %v", symbol, err)
 		return fmt.Errorf("Binance Futures API error on GetPositionRisk: %w", err)
@@ -119,14 +123,16 @@ func (om *OrderManager) closeFullFuturesPosition(symbol string) error {
 
 	// Шаг 3: Выставить ордер на закрытие
 	log.Printf("OrderManager: closeFullFuturesPosition: Placing %s market order to close position for %s, quantity %s", closeSide, symbol, quantity)
+	startCloseTime := time.Now()
 	orderService := om.FuturesClient.NewCreateOrderService() // Используем существующий клиент
 	orderService.Symbol(symbol)
 	orderService.Side(closeSide) // futures.SideType
 	orderService.Type(futures.OrderTypeMarket)
 	orderService.Quantity(quantity)
-	// orderService.Timestamp(time.Now().UnixMilli()) // <--- УДАЛЕНО (если было)
 
 	_, err = orderService.Do(context.Background())
+	getPositionCloseDuration := time.Since(startCloseTime)
+	log.Printf("OrderManager: GetPositionRisk API close for %s took %v", symbol, getPositionCloseDuration)
 	if err != nil {
 		log.Printf("OrderManager: Binance Futures API error on closeFullFuturesPosition for %s: %v", symbol, err)
 		return fmt.Errorf("Binance Futures API error on closeFullFuturesPosition: %w", err)
