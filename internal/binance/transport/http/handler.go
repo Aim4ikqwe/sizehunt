@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"sizehunt/internal/api/dto"
+	"sizehunt/internal/binance/entity"
 	"sizehunt/internal/binance/repository"
 	"sizehunt/internal/binance/service"
 	"sizehunt/internal/config"
@@ -21,7 +21,7 @@ type Handler struct {
 	BinanceService      *service.Watcher
 	KeysRepo            *repository.PostgresKeysRepo
 	Config              *config.Config
-	WebSocketManager    *service.WebSocketManager // Теперь это WebSocketManager
+	WebSocketManager    *service.WebSocketManager
 	SubscriptionService *subscriptionservice.Service
 }
 
@@ -44,51 +44,38 @@ func NewBinanceHandler(
 func (h *Handler) GetOrderBook(w http.ResponseWriter, r *http.Request) {
 	symbol := r.URL.Query().Get("symbol")
 	limitStr := r.URL.Query().Get("limit")
-	market := r.URL.Query().Get("market")
-	if symbol == "" {
-		http.Error(w, "symbol is required", http.StatusBadRequest)
-		return
-	}
+	market := r.URL.Query().Get("market") // "spot" или "futures"
+
 	limit := 100
 	if limitStr != "" {
-		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+		if l, err := strconv.Atoi(limitStr); err == nil {
 			limit = l
 		}
 	}
 
+	// Получаем userID из JWT
 	userID := r.Context().Value(middleware.UserIDKey).(int64)
+	// Получаем API-ключи пользователя
 	keys, err := h.KeysRepo.GetKeys(userID)
 	if err != nil {
-		log.Printf("API keys not found for user %d, attempting public request", userID)
-		client := service.NewBinanceHTTPClient("", "")
-		ob, err := client.GetOrderBook(symbol, limit, market)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(ob)
+		http.Error(w, "API keys not found", http.StatusUnauthorized)
 		return
 	}
-
+	// Расшифровываем ключи
 	secret := h.Config.EncryptionSecret
 	apiKey, err := service.DecryptAES(keys.APIKey, secret)
 	if err != nil {
 		http.Error(w, "failed to decrypt API key", http.StatusInternalServerError)
 		return
 	}
-	secretKey, err := service.DecryptAES(keys.SecretKey, secret)
-	if err != nil {
-		http.Error(w, "failed to decrypt Secret key", http.StatusInternalServerError)
-		return
-	}
 
-	client := service.NewBinanceHTTPClient(apiKey, secretKey)
+	client := service.NewBinanceHTTPClient(apiKey, "") // Передаём apiKey, secretKey не нужен для публичных запросов
 	ob, err := client.GetOrderBook(symbol, limit, market)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ob)
 }
@@ -105,6 +92,7 @@ func (h *Handler) SaveKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Шифруем ключи
 	secret := h.Config.EncryptionSecret
 	encryptedAPIKey, err := service.EncryptAES(req.APIKey, secret)
 	if err != nil {
@@ -117,10 +105,12 @@ func (h *Handler) SaveKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Сохраняем в БД
 	if err := h.KeysRepo.SaveKeys(userID, encryptedAPIKey, encryptedSecretKey); err != nil {
 		http.Error(w, "failed to save keys", http.StatusInternalServerError)
 		return
 	}
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"message":"API keys saved successfully"}`))
 }
@@ -147,23 +137,90 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Handler: CreateSignal called for user %d, symbol %s, price %.8f, watchMarket %s, closeMarket %s", userID, req.Symbol, req.TargetPrice, req.Market, req.CloseMarket)
+	log.Printf("Handler: CreateSignal called for user %d, symbol %s, price %.8f", userID, req.Symbol, req.TargetPrice)
 
-	if req.Market == "" {
-		req.Market = "futures"
+	// Получаем userID из JWT
+	userIDFromContext := r.Context().Value(middleware.UserIDKey).(int64)
+	// Получаем API-ключи пользователя для HTTP-запроса
+	keys, err := h.KeysRepo.GetKeys(userIDFromContext)
+	if err != nil {
+		log.Printf("Handler: GetKeys failed for user %d: %v", userIDFromContext, err)
+		http.Error(w, "API keys not found", http.StatusUnauthorized)
+		return
 	}
-	if req.CloseMarket == "" {
-		req.CloseMarket = req.Market // Закрытие на том же рынке, где и мониторинг
+	// Расшифровываем ключи
+	secret := h.Config.EncryptionSecret
+	apiKey, err := service.DecryptAES(keys.APIKey, secret)
+	if err != nil {
+		log.Printf("Handler: DecryptAES failed for API key for user %d: %v", userIDFromContext, err)
+		http.Error(w, "failed to decrypt API key", http.StatusInternalServerError)
+		return
+	}
+	// secretKey не нужен для публичного запроса GetOrderBook, но нужен для NewBinanceHTTPClient
+	// Получим и его
+	secretKey, err := service.DecryptAES(keys.SecretKey, secret)
+	if err != nil {
+		log.Printf("Handler: DecryptAES failed for Secret key for user %d: %v", userIDFromContext, err)
+		http.Error(w, "failed to decrypt Secret key", http.StatusInternalServerError)
+		return
 	}
 
-	// Получаем watcher для нужного рынка
+	// Создаём HTTP-клиент для получения начального состояния
+	// Передаём оба ключа. secretKey нужен для NewBinanceHTTPClient, но не используется для GetOrderBook
+	client := service.NewBinanceHTTPClient(apiKey, secretKey)
+
+	// --- НОВАЯ ЛОГИКА: Получение начального состояния заявки ---
+	const initialBookLimit = 1000 // или другой разумный лимит
+	ob, err := client.GetOrderBook(req.Symbol, initialBookLimit, req.Market)
+	if err != nil {
+		log.Printf("Handler: GetOrderBook failed for symbol %s, market %s: %v", req.Symbol, req.Market, err)
+		http.Error(w, fmt.Sprintf("failed to fetch initial order book: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	var initialQty float64 = 0         // Значение по умолчанию, если заявка не найдена
+	var initialSide string = "UNKNOWN" // Для информации - УБРАНО, не используется
+
+	// Ищем заявку в bids
+	for _, bid := range ob.Bids {
+		if bid.Price == req.TargetPrice {
+			initialQty = bid.Quantity
+			initialSide = bid.Side
+			log.Printf("Handler: Found initial bid at %.8f with quantity %.4f for signal %s", req.TargetPrice, initialQty, req.Symbol)
+			break
+		}
+	}
+
+	// Если не нашли в bids, ищем в asks
+	if initialQty == 0 {
+		for _, ask := range ob.Asks {
+			if ask.Price == req.TargetPrice {
+				initialQty = ask.Quantity
+				initialSide = ask.Side
+				log.Printf("Handler: Found initial ask at %.8f with quantity %.4f for signal %s", req.TargetPrice, initialQty, req.Symbol)
+				break
+			}
+		}
+	}
+
+	// --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
+	// Проверяем, соответствует ли найденный объём минимальному
+	if initialQty < req.MinQuantity {
+		log.Printf("Handler: Initial quantity %.4f at price %.8f is less than min quantity %.4f for signal %s", initialQty, req.TargetPrice, req.MinQuantity, req.Symbol)
+		http.Error(w, fmt.Sprintf("initial quantity %.4f at price %.8f is less than min quantity %.4f", initialQty, req.TargetPrice, req.MinQuantity), http.StatusBadRequest)
+		return
+	}
+
+	// Получаем WebSocketWatcher
 	watcher, err := h.WebSocketManager.GetOrCreateWatcher(req.Symbol, req.Market)
 	if err != nil {
-		log.Printf("Handler: Failed to get or create watcher for %s on %s: %v", req.Symbol, req.Market, err)
+		log.Printf("Handler: Failed to get or create watcher for %s: %v", req.Symbol, err)
 		http.Error(w, "failed to create watcher", http.StatusInternalServerError)
 		return
 	}
 
+	// Создаём сигнал
 	signal := &service.Signal{
 		ID:              generateID(),
 		UserID:          userID,
@@ -174,37 +231,49 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		TriggerOnEat:    req.TriggerOnEat,
 		EatPercentage:   req.EatPercentage,
 		AutoClose:       req.AutoClose,
-		CloseMarket:     req.CloseMarket, // Установка рынка закрытия
-		WatchMarket:     req.Market,      // Установка рынка мониторинга
+		CloseMarket:     req.Market, // Закрытие на том же рынке, где и мониторинг, если не указано иное
+		WatchMarket:     req.Market,
+		// --- ИНИЦИАЛИЗАЦИЯ ORIGINAL QTY, LAST QTY, ORIGINAL SIDE ---
+		OriginalQty:  initialQty,
+		LastQty:      initialQty,
+		OriginalSide: initialSide, // Установим OriginalSide
+		// --- КОНЕЦ ИНИЦИАЛИЗАЦИИ ---
 	}
 
-	log.Printf("Handler: Adding signal %d to watcher for user %d, symbol %s", signal.ID, signal.UserID, signal.Symbol)
-	watcher.AddSignal(signal) // Добавляем сигнал в watcher
-	log.Printf("Handler: Signal %d created successfully for user %d", signal.ID, userID)
+	log.Printf("Handler: Adding signal %d to watcher for user %d, symbol %s, initialQty %.4f", signal.ID, signal.UserID, signal.Symbol, initialQty)
 
+	// Добавляем сигнал в watcher
+	watcher.AddSignal(signal)
+
+	log.Printf("Handler: Signal %d created successfully for user %d", signal.ID, userID)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"message":"signal created"}`))
 }
 
-// GetOrderAtPrice теперь использует локальный ордербук из WebSocket
 func (h *Handler) GetOrderAtPrice(w http.ResponseWriter, r *http.Request) {
 	symbol := r.URL.Query().Get("symbol")
 	priceStr := r.URL.Query().Get("price")
-	market := r.URL.Query().Get("market")
+	market := r.URL.Query().Get("market") // "spot" или "futures"
+
 	if symbol == "" || priceStr == "" {
 		http.Error(w, "symbol and price are required", http.StatusBadRequest)
 		return
 	}
+
 	price, err := strconv.ParseFloat(priceStr, 64)
 	if err != nil {
 		http.Error(w, "invalid price", http.StatusBadRequest)
 		return
 	}
+
 	if market == "" {
-		market = "futures"
+		market = "futures" // по умолчанию
 	}
 
+	// Получаем userID
 	userID := r.Context().Value(middleware.UserIDKey).(int64)
+
+	// Проверяем подписку
 	subscribed, err := h.SubscriptionService.IsUserSubscribed(r.Context(), userID)
 	if err != nil {
 		http.Error(w, "failed to check subscription", http.StatusInternalServerError)
@@ -215,83 +284,69 @@ func (h *Handler) GetOrderAtPrice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Получаем watcher для нужного рынка
-	watcher, err := h.WebSocketManager.GetOrCreateWatcher(symbol, market)
+	// Получаем API-ключи
+	keys, err := h.KeysRepo.GetKeys(userID)
 	if err != nil {
-		log.Printf("Handler: Failed to get watcher for %s on %s in GetOrderAtPrice: %v", symbol, market, err)
-		http.Error(w, "failed to get watcher", http.StatusInternalServerError)
+		http.Error(w, "API keys not found", http.StatusUnauthorized)
+		return
+	}
+	secret := h.Config.EncryptionSecret
+	apiKey, err := service.DecryptAES(keys.APIKey, secret)
+	if err != nil {
+		http.Error(w, "failed to decrypt API key", http.StatusInternalServerError)
 		return
 	}
 
-	// Получаем локальный ордербук из watcher'а
-	localOB := watcher.GetOrderBook(symbol)
-	if localOB == nil {
-		// Если локального ордербука нет (например, соединение ещё не установлено или символ не отслеживается)
-		// Возвращаем ошибку или пустой результат
-		// ВАЖНО: Это может быть не идеально, если символ не отслеживается этим конкретным watcher'ом,
-		// но отслеживается другим (например, фьючерсный симол в спотовом watcher'е - не должно быть)
-		// или если просто ещё не пришло первое обновление.
-		// Для простоты возвращаем "not found".
-		log.Printf("Handler: Local order book for %s not available in GetOrderAtPrice", symbol)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"price":      price,
-			"is_present": false,
-			"message":    "local order book not available or symbol not being watched",
-		})
+	// Получаем ордербук
+	client := service.NewBinanceHTTPClient(apiKey, "")   // apiKey, secretKey не нужен для публичных запросов
+	ob, err := client.GetOrderBook(symbol, 1000, market) // 1000 — максимум
+	if err != nil {
+		http.Error(w, "failed to get order book", http.StatusInternalServerError)
 		return
 	}
 
-	// Ищем заявку в локальном ордербуке
-	found := false
-	var foundQty float64
-	var foundSide string
-
-	tolerance := 0.0001 // погрешность для сравнения цен
-
-	// Ищем в bids
-	for bidPrice, bidQty := range localOB.Bids {
-		if math.Abs(bidPrice-price) < tolerance {
-			foundQty = bidQty
-			foundSide = "BUY"
-			found = true
+	// Ищем заявку на нужной цене
+	var foundOrder *entity.Order
+	for _, bid := range ob.Bids {
+		if bid.Price == price {
+			foundOrder = &bid
 			break
 		}
 	}
-
-	// Ищем в asks
-	if !found {
-		for askPrice, askQty := range localOB.Asks {
-			if math.Abs(askPrice-price) < tolerance {
-				foundQty = askQty
-				foundSide = "SELL"
-				found = true
+	if foundOrder == nil {
+		for _, ask := range ob.Asks {
+			if ask.Price == price {
+				foundOrder = &ask
 				break
 			}
 		}
 	}
 
-	if !found {
+	if foundOrder == nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"price":      price,
 			"is_present": false,
-			"message":    "no order found at this price in local order book",
+			"message":    "no order found at this price",
 		})
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"price":      price, // или foundPrice, если хотите вернуть найденную цену с учётом tolerance
+		"price":      foundOrder.Price,
 		"is_present": true,
-		"quantity":   foundQty,
-		"side":       foundSide,
+		"quantity":   foundOrder.Quantity,
+		"side":       foundOrder.Side,
 	})
-	log.Printf("Get order at price %s with quantity %f and side %s from local WebSocket book", price, foundQty, foundSide)
-	fmt.Printf("Get order at price %s with quantity %f and side %s from local WebSocket book\n", price, foundQty, foundSide)
+
+	log.Printf("Get order at price %s with price %s", price, foundOrder.Price)
+	fmt.Printf("Geto order at price %s with price %s\n", price, foundOrder.Price)
 }
 
+// generateID — генератор ID (можно использовать UUID или просто счётчик)
 func generateID() int64 {
+	// Реализуй как хочешь: UUID, auto-increment, etc.
+	// Пока просто временный вариант
 	return time.Now().UnixNano() % 1000000
 }

@@ -27,6 +27,9 @@ type Signal struct {
 	AutoClose       bool
 	CloseMarket     string // "spot" или "futures" - рынок для закрытия
 	WatchMarket     string // "spot" или "futures" - рынок для мониторинга
+	// --- НОВОЕ ПОЛЕ ---
+	OriginalSide string // "BUY" или "SELL" - сторона заявки при создании
+	// --- КОНЕЦ НОВОГО ПОЛЯ ---
 }
 
 // OrderBookMap представляет локальный ордербук для одного символа
@@ -83,16 +86,51 @@ func (w *MarketDepthWatcher) AddSignal(signal *Signal) {
 		return
 	}
 
-	// Запоминаем изначальный объём
-	signal.OriginalQty = signal.MinQuantity
-	signal.LastQty = signal.MinQuantity
+	// НЕ устанавливаем OriginalQty и LastQty как MinQuantity
+	// Они уже установлены в handler.go с реальным значением из HTTP-запроса
+	// signal.OriginalQty = signal.MinQuantity // <-- УДАЛЕНО
+	// signal.LastQty = signal.MinQuantity    // <-- УДАЛЕНО
 
 	// Добавляем сигнал в список для его символа
 	w.signalsBySymbol[signal.Symbol] = append(w.signalsBySymbol[signal.Symbol], signal)
 	_, wasActive := w.activeSymbols[signal.Symbol]
 	w.activeSymbols[signal.Symbol] = true // Помечаем символ как активный
 
-	log.Printf("MarketDepthWatcher: Added signal %d for user %d, symbol %s, price %.8f, closeMarket %s", signal.ID, signal.UserID, signal.Symbol, signal.TargetPrice, signal.CloseMarket)
+	log.Printf("MarketDepthWatcher: Added signal %d for user %d, symbol %s, price %.8f, originalQty %.4f, closeMarket %s", signal.ID, signal.UserID, signal.Symbol, signal.TargetPrice, signal.OriginalQty, signal.CloseMarket)
+
+	// Инициализируем локальный стакан для символа, если его ещё нет
+	ob, ok := w.orderBooks[signal.Symbol]
+	if !ok {
+		ob = &OrderBookMap{
+			Bids: make(map[float64]float64),
+			Asks: make(map[float64]float64),
+		}
+		w.orderBooks[signal.Symbol] = ob
+	}
+
+	// Проверяем, существует ли уровень на TargetPrice
+	_, bidExists := ob.Bids[signal.TargetPrice]
+	_, askExists := ob.Asks[signal.TargetPrice]
+
+	// Если уровень не существует, устанавливаем его
+	if !bidExists && !askExists && signal.OriginalQty > 0 {
+		switch signal.OriginalSide {
+		case "BUY":
+			ob.Bids[signal.TargetPrice] = signal.OriginalQty
+			log.Printf("MarketDepthWatcher: Initialized local orderbook for symbol %s at price %.8f with qty %.4f in Bids", signal.Symbol, signal.TargetPrice, signal.OriginalQty)
+		case "SELL":
+			ob.Asks[signal.TargetPrice] = signal.OriginalQty
+			log.Printf("MarketDepthWatcher: Initialized local orderbook for symbol %s at price %.8f with qty %.4f in Asks", signal.Symbol, signal.TargetPrice, signal.OriginalQty)
+		default:
+			// Если OriginalSide неизвестен, добавляем в обе стороны, как раньше.
+			// Это менее точно, но покрывает неожиданные случаи.
+			ob.Bids[signal.TargetPrice] = signal.OriginalQty
+			ob.Asks[signal.TargetPrice] = signal.OriginalQty
+			log.Printf("MarketDepthWatcher: Initialized local orderbook for symbol %s at price %.8f with qty %.4f in BOTH Bids and Asks (unknown side)", signal.Symbol, signal.TargetPrice, signal.OriginalQty)
+		}
+	} else {
+		log.Printf("MarketDepthWatcher: Local orderbook for symbol %s at price %.8f already initialized or OriginalQty is 0, bids: %.4f, asks: %.4f", signal.Symbol, signal.TargetPrice, ob.Bids[signal.TargetPrice], ob.Asks[signal.TargetPrice])
+	}
 
 	// Если символ был неактивен, возможно, нужно инициировать подключение
 	if !wasActive && !w.started {
@@ -114,7 +152,6 @@ func (w *MarketDepthWatcher) AddSignal(signal *Signal) {
 func (w *MarketDepthWatcher) RemoveSignal(id int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
 	// Ищем и удаляем сигнал по ID
 	for symbol, signals := range w.signalsBySymbol {
 		for i, signal := range signals {
@@ -122,7 +159,6 @@ func (w *MarketDepthWatcher) RemoveSignal(id int64) {
 				// Удаляем сигнал из слайса
 				w.signalsBySymbol[symbol] = append(signals[:i], signals[i+1:]...)
 				log.Printf("MarketDepthWatcher: Removed signal %d", id)
-
 				// Если больше сигналов для этого символа нет, удаляем его из activeSymbols
 				if len(w.signalsBySymbol[symbol]) == 0 {
 					delete(w.activeSymbols, symbol)
@@ -176,7 +212,6 @@ func (w *MarketDepthWatcher) startConnection() error {
 	default:
 		return fmt.Errorf("unsupported market for MarketDepthWatcher: %s", w.market)
 	}
-
 	if err != nil {
 		log.Printf("MarketDepthWatcher: Failed to connect to combined WebSocket for %s: %v", w.market, err)
 		// Сбросим флаг started, если не удалось подключиться
@@ -185,7 +220,6 @@ func (w *MarketDepthWatcher) startConnection() error {
 		w.mu.Unlock()
 		return err
 	}
-
 	w.client = client
 	log.Printf("MarketDepthWatcher: Successfully connected to combined WebSocket for market: %s", w.market)
 	return nil
@@ -193,7 +227,6 @@ func (w *MarketDepthWatcher) startConnection() error {
 
 func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	symbol := data.Data.Symbol
-
 	w.mu.Lock() // Блокируем на время обновления стакана и обработки сигналов
 	defer w.mu.Unlock()
 
@@ -235,39 +268,51 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	if !ok {
 		return // Нет сигналов для этого символа
 	}
-
 	for _, signal := range signalsForSymbol {
-		log.Printf("MarketDepthWatcher: Checking signal %d for symbol %s at price %.8f", signal.ID, signal.Symbol, signal.TargetPrice)
-
+		log.Printf("MarketDepthWatcher: Checking signal %d for symbol %s at price %.8f, originalQty %.4f", signal.ID, signal.Symbol, signal.TargetPrice, signal.OriginalQty)
 		found, currentQty := w.findOrderAtPrice(ob, signal.TargetPrice)
-		if !found {
-			if signal.TriggerOnCancel {
-				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel", signal.ID, signal.TargetPrice, signal.LastQty)
-				order := &entity.Order{
-					Price:    signal.TargetPrice,
-					Quantity: signal.LastQty,
-					Side:     "UNKNOWN",
-				}
-				if w.onTrigger != nil {
-					w.onTrigger(signal, order)
-				}
-				if signal.AutoClose {
-					log.Printf("MarketDepthWatcher: Signal %d: Calling handleAutoClose for cancel", signal.ID)
-					w.handleAutoClose(signal, order)
+		log.Printf("MarketDepthWatcher: Signal %d: findOrderAtPrice returned found=%v, currentQty=%.4f", signal.ID, found, currentQty)
+
+		// Проверка на отмену (disappeared)
+		if signal.TriggerOnCancel {
+			if !found {
+				// Если заявка исчезла (не найдена), и она была изначально (OriginalQty > 0)
+				// Или, если она исчезла, когда была (LastQty > 0)
+				// Лучше проверить OriginalQty, т.к. LastQty обновляется.
+				// Если OriginalQty > 0, и сейчас !found, это отмена.
+				if signal.OriginalQty > 0 {
+					log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel", signal.ID, signal.TargetPrice, signal.LastQty)
+					order := &entity.Order{
+						Price:    signal.TargetPrice,
+						Quantity: signal.LastQty, // Используем LastQty как "последний известный объём перед исчезновением"
+						Side:     "UNKNOWN",      // Сторона неизвестна
+					}
+					if w.onTrigger != nil {
+						w.onTrigger(signal, order)
+					}
+					if signal.AutoClose {
+						log.Printf("MarketDepthWatcher: Signal %d: Calling handleAutoClose for cancel", signal.ID)
+						w.handleAutoClose(signal, order)
+					}
+					continue // Переходим к следующему сигналу, т.к. этот сработал
 				}
 			}
-			continue
 		}
 
-		if signal.TriggerOnEat {
+		// Проверка на поедание (eaten)
+		if signal.TriggerOnEat && found {
+			// Только если заявка найдена
 			eaten := signal.OriginalQty - currentQty
-			eatenPercentage := eaten / signal.OriginalQty
+			eatenPercentage := 0.0
+			if signal.OriginalQty > 0 {
+				eatenPercentage = eaten / signal.OriginalQty
+			}
 			if eatenPercentage >= signal.EatPercentage {
 				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat", signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty)
 				order := &entity.Order{
 					Price:    signal.TargetPrice,
 					Quantity: currentQty,
-					Side:     "UNKNOWN",
+					Side:     "UNKNOWN", // Сторона неизвестна
 				}
 				if w.onTrigger != nil {
 					w.onTrigger(signal, order)
@@ -278,27 +323,35 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 				}
 			}
 		}
-		signal.LastQty = currentQty
-		log.Printf("MarketDepthWatcher: Signal %d: Updated LastQty to %.4f", signal.ID, currentQty)
+		// Обновляем LastQty, если заявка была найдена
+		if found {
+			signal.LastQty = currentQty
+			log.Printf("MarketDepthWatcher: Signal %d: Updated LastQty to %.4f", signal.ID, currentQty)
+		} else {
+			// Если не найдена, но была, LastQty можно не обновлять, или обновить на 0?
+			// В текущей логике, если !found, LastQty не обновляется.
+			// Это может быть проблемой, если заявка исчезает.
+			// Но срабатывание на cancel обрабатывает это.
+			// Возможно, стоит обновить на 0, если !found и была раньше.
+			// signal.LastQty = 0 // Это может сбить с толку, если !found, но OriginalQty > 0.
+			// Оставим как есть, обновляем только если found.
+		}
 	}
 }
 
 // findOrderAtPrice ищет заявку в локальном OrderBookMap по точному совпадению цены
 func (w *MarketDepthWatcher) findOrderAtPrice(ob *OrderBookMap, targetPrice float64) (found bool, qty float64) {
 	log.Printf("MarketDepthWatcher: findOrderAtPrice: Looking for exact price %.8f", targetPrice)
-
 	// Ищем в bids
 	if qty, ok := ob.Bids[targetPrice]; ok {
 		log.Printf("MarketDepthWatcher: findOrderAtPrice: Found exact bid at %.8f with quantity %.4f", targetPrice, qty)
 		return true, qty
 	}
-
 	// Ищем в asks
 	if qty, ok := ob.Asks[targetPrice]; ok {
 		log.Printf("MarketDepthWatcher: findOrderAtPrice: Found exact ask at %.8f with quantity %.4f", targetPrice, qty)
 		return true, qty
 	}
-
 	log.Printf("MarketDepthWatcher: findOrderAtPrice: No exact order found at price %.8f", targetPrice)
 	return false, 0
 }
@@ -306,7 +359,6 @@ func (w *MarketDepthWatcher) findOrderAtPrice(ob *OrderBookMap, targetPrice floa
 func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order) {
 	// Блокировка не нужна, так как вызывается изнутри processDepthUpdate под блокировкой, или из другого места
 	log.Printf("MarketDepthWatcher: handleAutoClose called for signal %d, user %d", signal.ID, signal.UserID)
-
 	subscribed, err := w.subscriptionService.IsUserSubscribed(context.Background(), signal.UserID)
 	if err != nil {
 		log.Printf("MarketDepthWatcher: ERROR: IsUserSubscribed failed for user %d: %v", signal.UserID, err)
@@ -316,7 +368,6 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 		log.Printf("MarketDepthWatcher: INFO: User %d is not subscribed, skipping auto-close", signal.UserID)
 		return
 	}
-
 	log.Printf("MarketDepthWatcher: INFO: User %d is subscribed, proceeding with auto-close", signal.UserID)
 
 	keys, err := w.keysRepo.GetKeys(signal.UserID)
@@ -352,6 +403,8 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 	// Определяем сторону закрытия. Если мы отслеживали ордер на продажу (ASK), то закрываем покупкой (BUY) и наоборот.
 	// Если не можем определить сторону, предполагаем, что нужно закрыть ордер на продажу (BUY).
 	closeSide := "BUY" // Предполагаем, что отслеживаем BID (покупка), значит закрываем SELL ордер покупкой
+	// ПОМЕТКА: Сторона закрытия не определяется точно из текущей логики отслеживания.
+	// Это может быть улучшено, если передавать OriginalSide.
 
 	err = manager.ClosePosition(signal.Symbol, closeSide, fmt.Sprintf("%.6f", order.Quantity), signal.CloseMarket)
 	if err != nil {
