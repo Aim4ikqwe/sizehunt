@@ -231,7 +231,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		TriggerOnEat:    req.TriggerOnEat,
 		EatPercentage:   req.EatPercentage,
 		AutoClose:       req.AutoClose,
-		CloseMarket:     req.Market, // Закрытие на том же рынке, где и мониторинг, если не указано иное
+		CloseMarket:     req.CloseMarket, // Закрытие на том же рынке, где и мониторинг, если не указано иное
 		WatchMarket:     req.Market,
 		// --- ИНИЦИАЛИЗАЦИЯ ORIGINAL QTY, LAST QTY, ORIGINAL SIDE ---
 		OriginalQty:  initialQty,

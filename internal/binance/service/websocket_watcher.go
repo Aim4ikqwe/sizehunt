@@ -5,12 +5,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
+	"sync"
+	"time"
+
 	"sizehunt/internal/binance/entity"
 	binance_repository "sizehunt/internal/binance/repository"
 	"sizehunt/internal/config"
 	subscriptionservice "sizehunt/internal/subscription/service"
-	"strconv"
-	"sync"
 )
 
 type Signal struct {
@@ -27,9 +29,12 @@ type Signal struct {
 	AutoClose       bool
 	CloseMarket     string // "spot" или "futures" - рынок для закрытия
 	WatchMarket     string // "spot" или "futures" - рынок для мониторинга
-	// --- НОВОЕ ПОЛЕ ---
-	OriginalSide string // "BUY" или "SELL" - сторона заявки при создании
-	// --- КОНЕЦ НОВОГО ПОЛЯ ---
+	// --- ДОБАВЛЕННЫЕ ПОЛЯ ---
+	OriginalSide     string    // "BUY" или "SELL" - сторона заявки при создании
+	TriggerTime      time.Time // Время срабатывания триггера (установлено в processDepthUpdate)
+	BinanceEventTime time.Time // Время события на бирже (из WebSocket)
+	// --- КОНЕЦ ДОБАВЛЕННЫХ ПОЛЕЙ ---
+	AutoCloseExecuted bool
 }
 
 // OrderBookMap представляет локальный ордербук для одного символа
@@ -174,13 +179,14 @@ func (w *MarketDepthWatcher) RemoveSignal(id int64) {
 func (w *MarketDepthWatcher) startConnection() error {
 	client := NewWebSocketClient()
 	client.OnData = func(data *UnifiedDepthStreamData) {
-		if len(data.Data.Bids) > 0 && len(data.Data.Asks) > 0 {
-			bidPrice, _ := strconv.ParseFloat(data.Data.Bids[0][0], 64)
-			bidQty, _ := strconv.ParseFloat(data.Data.Bids[0][1], 64)
-			askPrice, _ := strconv.ParseFloat(data.Data.Asks[0][0], 64)
-			askQty, _ := strconv.ParseFloat(data.Data.Asks[0][1], 64)
-			log.Printf("MarketDepthWatcher: Received data for %s (%s), first bid: %.8f (%.4f), first ask: %.8f (%.4f)", data.Data.Symbol, w.market, bidPrice, bidQty, askPrice, askQty)
-		}
+		// Убираем логирование каждого пришедшего апдейта
+		// if len(data.Data.Bids) > 0 && len(data.Data.Asks) > 0 {
+		// 	bidPrice, _ := strconv.ParseFloat(data.Data.Bids[0][0], 64)
+		// 	bidQty, _ := strconv.ParseFloat(data.Data.Bids[0][1], 64)
+		// 	askPrice, _ := strconv.ParseFloat(data.Data.Asks[0][0], 64)
+		// 	askQty, _ := strconv.ParseFloat(data.Data.Asks[0][1], 64)
+		// 	log.Printf("MarketDepthWatcher: Received data for %s (%s), first bid: %.8f (%.4f), first ask: %.8f (%.4f)", data.Data.Symbol, w.market, bidPrice, bidQty, askPrice, askQty)
+		// }
 		w.processDepthUpdate(data)
 	}
 
@@ -230,6 +236,14 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	w.mu.Lock() // Блокируем на время обновления стакана и обработки сигналов
 	defer w.mu.Unlock()
 
+	// --- ИЗМЕРЕНИЕ ЗАДЕРЖКИ СЕТЕВОГО СОБЫТИЯ (опционально) ---
+	// binanceEventTime := time.UnixMilli(data.Data.EventTime)
+	// receivedTime := time.Now()
+	// networkLatency := receivedTime.Sub(binanceEventTime)
+	// log.Printf("MarketDepthWatcher: Network+Processing latency for %s: %v (EventTime: %v, Received: %v)",
+	// 	symbol, networkLatency, binanceEventTime, receivedTime)
+	// --- КОНЕЦ ИЗМЕРЕНИЯ ---
+
 	// Получаем или создаём локальный стакан для символа
 	ob, ok := w.orderBooks[symbol]
 	if !ok {
@@ -268,10 +282,16 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	if !ok {
 		return // Нет сигналов для этого символа
 	}
+	// Преобразуем EventTime из миллисекунд в time.Time
+	binanceEventTime := time.UnixMilli(data.Data.EventTime)
+
 	for _, signal := range signalsForSymbol {
-		log.Printf("MarketDepthWatcher: Checking signal %d for symbol %s at price %.8f, originalQty %.4f", signal.ID, signal.Symbol, signal.TargetPrice, signal.OriginalQty)
+		if signal.AutoCloseExecuted {
+			continue // Пропускаем сигнал, если автозакрытие уже выполнено
+		}
+		// log.Printf("MarketDepthWatcher: Checking signal %d for symbol %s at price %.8f, originalQty %.4f", signal.ID, signal.Symbol, signal.TargetPrice, signal.OriginalQty) // <-- УБРАНО
 		found, currentQty := w.findOrderAtPrice(ob, signal.TargetPrice)
-		log.Printf("MarketDepthWatcher: Signal %d: findOrderAtPrice returned found=%v, currentQty=%.4f", signal.ID, found, currentQty)
+		// log.Printf("MarketDepthWatcher: Signal %d: findOrderAtPrice returned found=%v, currentQty=%.4f", signal.ID, found, currentQty) // <-- УБРАНО
 
 		// Проверка на отмену (disappeared)
 		if signal.TriggerOnCancel {
@@ -281,7 +301,10 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 				// Лучше проверить OriginalQty, т.к. LastQty обновляется.
 				// Если OriginalQty > 0, и сейчас !found, это отмена.
 				if signal.OriginalQty > 0 {
-					log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel", signal.ID, signal.TargetPrice, signal.LastQty)
+					triggerTime := time.Now() // ЗАПИСЬ ВРЕМЕНИ СРАБАТЫВАНИЯ ТРИГГЕРА
+					signal.TriggerTime = triggerTime
+					signal.BinanceEventTime = binanceEventTime // <-- ЗАПИСЬ ВРЕМЕНИ СОБЫТИЯ НА БИРЖЕ
+					log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel at %v (Binance EventTime: %v)", signal.ID, signal.TargetPrice, signal.LastQty, triggerTime, binanceEventTime)
 					order := &entity.Order{
 						Price:    signal.TargetPrice,
 						Quantity: signal.LastQty, // Используем LastQty как "последний известный объём перед исчезновением"
@@ -308,7 +331,10 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 				eatenPercentage = eaten / signal.OriginalQty
 			}
 			if eatenPercentage >= signal.EatPercentage {
-				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat", signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty)
+				triggerTime := time.Now() // ЗАПИСЬ ВРЕМЕНИ СРАБАТЫВАНИЯ ТРИГГЕРА
+				signal.TriggerTime = triggerTime
+				signal.BinanceEventTime = binanceEventTime // <-- ЗАПИСЬ ВРЕМЕНИ СОБЫТИЯ НА БИРЖЕ
+				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat at %v (Binance EventTime: %v)", signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty, triggerTime, binanceEventTime)
 				order := &entity.Order{
 					Price:    signal.TargetPrice,
 					Quantity: currentQty,
@@ -326,7 +352,7 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		// Обновляем LastQty, если заявка была найдена
 		if found {
 			signal.LastQty = currentQty
-			log.Printf("MarketDepthWatcher: Signal %d: Updated LastQty to %.4f", signal.ID, currentQty)
+			// log.Printf("MarketDepthWatcher: Signal %d: Updated LastQty to %.4f", signal.ID, currentQty) // <-- УБРАНО
 		} else {
 			// Если не найдена, но была, LastQty можно не обновлять, или обновить на 0?
 			// В текущей логике, если !found, LastQty не обновляется.
@@ -341,18 +367,18 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 
 // findOrderAtPrice ищет заявку в локальном OrderBookMap по точному совпадению цены
 func (w *MarketDepthWatcher) findOrderAtPrice(ob *OrderBookMap, targetPrice float64) (found bool, qty float64) {
-	log.Printf("MarketDepthWatcher: findOrderAtPrice: Looking for exact price %.8f", targetPrice)
+	// log.Printf("MarketDepthWatcher: findOrderAtPrice: Looking for exact price %.8f", targetPrice) // <-- УБРАНО
 	// Ищем в bids
 	if qty, ok := ob.Bids[targetPrice]; ok {
-		log.Printf("MarketDepthWatcher: findOrderAtPrice: Found exact bid at %.8f with quantity %.4f", targetPrice, qty)
+		// log.Printf("MarketDepthWatcher: findOrderAtPrice: Found exact bid at %.8f with quantity %.4f", targetPrice, qty) // <-- УБРАНО
 		return true, qty
 	}
 	// Ищем в asks
 	if qty, ok := ob.Asks[targetPrice]; ok {
-		log.Printf("MarketDepthWatcher: findOrderAtPrice: Found exact ask at %.8f with quantity %.4f", targetPrice, qty)
+		// log.Printf("MarketDepthWatcher: findOrderAtPrice: Found exact ask at %.8f with quantity %.4f", targetPrice, qty) // <-- УБРАНО
 		return true, qty
 	}
-	log.Printf("MarketDepthWatcher: findOrderAtPrice: No exact order found at price %.8f", targetPrice)
+	// log.Printf("MarketDepthWatcher: findOrderAtPrice: No exact order found at price %.8f", targetPrice) // <-- УБРАНО
 	return false, 0
 }
 
@@ -418,6 +444,10 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 
 	log.Printf("MarketDepthWatcher: INFO: Attempting to close FULL position for signal %d by placing %s order", signal.ID, closeSide)
 
+	// --- ИЗМЕРЕНИЕ LATENCY (от Binance EventTime до конца handleAutoClose) ---
+	startTime := time.Now()
+	// --- КОНЕЦ ИЗМЕРЕНИЯ ---
+
 	// --- ВЫЗОВ НОВОГО МЕТОДА ---
 	err = manager.CloseFullPosition(signal.Symbol, closeSide, signal.CloseMarket)
 	if err != nil {
@@ -425,6 +455,18 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 		return
 	}
 	// --- КОНЕЦ ВЫЗОВА ---
+	signal.AutoCloseExecuted = true
+
+	// --- ЛОГИРОВАНИЕ LATENCY ---
+	latencyFromBinanceEvent := time.Since(signal.BinanceEventTime) // от момента события на бирже до конца handleAutoClose
+	latencyFromTrigger := time.Since(signal.TriggerTime)           // от момента срабатывания триггера до конца handleAutoClose
+	latencyHandlerOnly := time.Since(startTime)                    // от начала handleAutoClose до конца
+	log.Printf("MarketDepthWatcher: Auto-close latency for signal %d:", signal.ID)
+	log.Printf("  - From Binance EventTime to end of handleAutoClose: %v", latencyFromBinanceEvent)
+	log.Printf("  - From TriggerTime to end of handleAutoClose: %v", latencyFromTrigger)
+	log.Printf("  - Time spent in handleAutoClose: %v", latencyHandlerOnly)
+	// --- КОНЕЦ ЛОГИРОВАНИЯ ---
+
 	log.Printf("MarketDepthWatcher: SUCCESS: FULL Position closed for user %d on %s", signal.UserID, signal.CloseMarket)
 }
 

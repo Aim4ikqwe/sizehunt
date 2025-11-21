@@ -4,9 +4,10 @@ package service
 import (
 	"context"
 	"fmt"
+	"log"
+
 	"github.com/adshao/go-binance/v2"
 	"github.com/adshao/go-binance/v2/futures"
-	"log"
 )
 
 // UnifiedDepthStreamData объединяет данные из разных рынков
@@ -18,6 +19,7 @@ type UnifiedDepthStreamData struct {
 // UnifiedDepthEvent объединяет структуры данных для спота и фьючерсов
 type UnifiedDepthEvent struct {
 	Symbol        string
+	EventTime     int64
 	FirstUpdateID int64
 	LastUpdateID  int64
 	Bids          [][]string // [][price, quantity]
@@ -49,6 +51,7 @@ func (w *WebSocketClient) ConnectForSpotCombined(ctx context.Context, symbols []
 		}
 		unifiedEvent := &UnifiedDepthEvent{
 			Symbol:        event.Symbol,
+			EventTime:     event.Time,
 			FirstUpdateID: event.FirstUpdateID,
 			LastUpdateID:  event.LastUpdateID,
 			Bids:          bids,
@@ -99,6 +102,7 @@ func (w *WebSocketClient) ConnectForFuturesCombined(ctx context.Context, symbolL
 		}
 		unifiedEvent := &UnifiedDepthEvent{
 			Symbol:        event.Symbol,
+			EventTime:     event.Time,
 			FirstUpdateID: event.FirstUpdateID,
 			LastUpdateID:  event.LastUpdateID,
 			Bids:          bids,
