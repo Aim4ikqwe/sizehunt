@@ -387,7 +387,7 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 		return
 	}
 
-	log.Printf("MarketDepthWatcher: INFO: Keys decrypted successfully for user %d, calling ClosePosition on %s", signal.UserID, signal.CloseMarket)
+	log.Printf("MarketDepthWatcher: INFO: Keys decrypted successfully for user %d, calling CloseFullPosition on %s", signal.UserID, signal.CloseMarket)
 
 	var manager *OrderManager
 	switch signal.CloseMarket {
@@ -400,18 +400,32 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 		return
 	}
 
-	// Определяем сторону закрытия. Если мы отслеживали ордер на продажу (ASK), то закрываем покупкой (BUY) и наоборот.
-	// Если не можем определить сторону, предполагаем, что нужно закрыть ордер на продажу (BUY).
-	closeSide := "BUY" // Предполагаем, что отслеживаем BID (покупка), значит закрываем SELL ордер покупкой
-	// ПОМЕТКА: Сторона закрытия не определяется точно из текущей логики отслеживания.
-	// Это может быть улучшено, если передавать OriginalSide.
+	// --- ОПРЕДЕЛЕНИЕ СТОРОНЫ ЗАКРЫТИЯ ---
+	// OriginalSide - это сторона заявки, которую мы отслеживали (ASK или BUY).
+	// Если мы отслеживали ASK (SELL), то, вероятно, кто-то открыл SHORT. Закрываем SHORT покупкой (BUY).
+	// Если мы отслеживали BID (BUY), то, вероятно, кто-то открыл LONG. Закрываем LONG продажей (SELL).
+	closeSide := "BUY" // Значение по умолчанию
+	switch signal.OriginalSide {
+	case "SELL": // Мы отслеживали A (ASK)
+		closeSide = "BUY" // Чтобы закрыть short, покупаем
+	case "BUY": // Мы отслеживали B (BID)
+		closeSide = "SELL" // Чтобы закрыть long, продаем
+	default:
+		log.Printf("MarketDepthWatcher: WARNING: Unknown OriginalSide '%s' for signal %d, defaulting to BUY", signal.OriginalSide, signal.ID)
+		// Можно оставить "BUY" или вернуть ошибку
+	}
+	// --- КОНЕЦ ОПРЕДЕЛЕНИЯ СТОРОНЫ ---
 
-	err = manager.ClosePosition(signal.Symbol, closeSide, fmt.Sprintf("%.6f", order.Quantity), signal.CloseMarket)
+	log.Printf("MarketDepthWatcher: INFO: Attempting to close FULL position for signal %d by placing %s order", signal.ID, closeSide)
+
+	// --- ВЫЗОВ НОВОГО МЕТОДА ---
+	err = manager.CloseFullPosition(signal.Symbol, closeSide, signal.CloseMarket)
 	if err != nil {
-		log.Printf("MarketDepthWatcher: ERROR: ClosePosition failed for user %d: %v", signal.UserID, err)
+		log.Printf("MarketDepthWatcher: ERROR: CloseFullPosition failed for user %d: %v", signal.UserID, err)
 		return
 	}
-	log.Printf("MarketDepthWatcher: SUCCESS: Position closed for user %d on %s", signal.UserID, signal.CloseMarket)
+	// --- КОНЕЦ ВЫЗОВА ---
+	log.Printf("MarketDepthWatcher: SUCCESS: FULL Position closed for user %d on %s", signal.UserID, signal.CloseMarket)
 }
 
 func (w *MarketDepthWatcher) SetOnTrigger(fn func(signal *Signal, order *entity.Order)) {
