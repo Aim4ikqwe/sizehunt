@@ -13,6 +13,8 @@ import (
 	binance_repository "sizehunt/internal/binance/repository"
 	"sizehunt/internal/config"
 	subscriptionservice "sizehunt/internal/subscription/service"
+
+	"github.com/adshao/go-binance/v2/futures"
 )
 
 type Signal struct {
@@ -59,25 +61,42 @@ type MarketDepthWatcher struct {
 	market              string          // "spot" или "futures"
 	ctx                 context.Context // Контекст для всего watcher'а
 	started             bool            // Флаг, указывающий, был ли запущен watcher
+	futuresClient       *futures.Client
+	positionWatcher     *PositionWatcher
+	userDataStream      *UserDataStream
 }
 
 func NewMarketDepthWatcher(
-	ctx context.Context, // Принимаем контекст
+	ctx context.Context,
 	market string,
 	subService *subscriptionservice.Service,
 	keysRepo *binance_repository.PostgresKeysRepo,
 	cfg *config.Config,
+	futuresClient *futures.Client,
+	positionWatcher *PositionWatcher,
+	userDataStream *UserDataStream,
 ) *MarketDepthWatcher {
+	// Инициализируем мапы
+	signalsBySymbol := make(map[string][]*Signal)
+	orderBooks := make(map[string]*OrderBookMap)
+	activeSymbols := make(map[string]bool)
+
 	return &MarketDepthWatcher{
-		signalsBySymbol:     make(map[string][]*Signal),
-		orderBooks:          make(map[string]*OrderBookMap),
-		activeSymbols:       make(map[string]bool),
+		client:              nil,
+		signalsBySymbol:     signalsBySymbol,
+		orderBooks:          orderBooks,
+		activeSymbols:       activeSymbols,
+		mu:                  sync.RWMutex{},
+		onTrigger:           nil,
 		subscriptionService: subService,
 		keysRepo:            keysRepo,
 		config:              cfg,
 		market:              market,
-		ctx:                 ctx,   // Сохраняем контекст
-		started:             false, // Инициализируем как false
+		ctx:                 ctx,
+		started:             false,
+		futuresClient:       futuresClient,
+		positionWatcher:     positionWatcher,
+		userDataStream:      userDataStream,
 	}
 }
 
@@ -316,6 +335,7 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 					if signal.AutoClose {
 						log.Printf("MarketDepthWatcher: Signal %d: Calling handleAutoClose for cancel", signal.ID)
 						w.handleAutoClose(signal, order)
+						signal.AutoCloseExecuted = true
 					}
 					continue // Переходим к следующему сигналу, т.к. этот сработал
 				}
@@ -383,8 +403,14 @@ func (w *MarketDepthWatcher) findOrderAtPrice(ob *OrderBookMap, targetPrice floa
 }
 
 func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order) {
-	// Блокировка не нужна, так как вызывается изнутри processDepthUpdate под блокировкой, или из другого места
+	if signal.CloseMarket != "futures" {
+		log.Printf("MarketDepthWatcher: ERROR: handleAutoClose for non-futures market %s not implemented", signal.CloseMarket)
+		return
+	}
+
 	log.Printf("MarketDepthWatcher: handleAutoClose called for signal %d, user %d", signal.ID, signal.UserID)
+
+	// Проверка подписки (остаётся)
 	subscribed, err := w.subscriptionService.IsUserSubscribed(context.Background(), signal.UserID)
 	if err != nil {
 		log.Printf("MarketDepthWatcher: ERROR: IsUserSubscribed failed for user %d: %v", signal.UserID, err)
@@ -394,78 +420,16 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 		log.Printf("MarketDepthWatcher: INFO: User %d is not subscribed, skipping auto-close", signal.UserID)
 		return
 	}
-	log.Printf("MarketDepthWatcher: INFO: User %d is subscribed, proceeding with auto-close", signal.UserID)
 
-	keys, err := w.keysRepo.GetKeys(signal.UserID)
-	if err != nil {
-		log.Printf("MarketDepthWatcher: ERROR: GetKeys failed for user %d: %v", signal.UserID, err)
-		return
-	}
-	secret := w.config.EncryptionSecret
-	apiKey, err := DecryptAES(keys.APIKey, secret)
-	if err != nil {
-		log.Printf("MarketDepthWatcher: ERROR: DecryptAES failed for user %d: %v", signal.UserID, err)
-		return
-	}
-	secretKey, err := DecryptAES(keys.SecretKey, secret)
-	if err != nil {
-		log.Printf("MarketDepthWatcher: ERROR: DecryptAES failed for user %d: %v", signal.UserID, err)
-		return
-	}
+	// Создание OrderManager с уже существующими зависимостями
+	manager := NewOrderManager(w.futuresClient, w.positionWatcher)
 
-	log.Printf("MarketDepthWatcher: INFO: Keys decrypted successfully for user %d, calling CloseFullPosition on %s", signal.UserID, signal.CloseMarket)
-
-	var manager *OrderManager
-	switch signal.CloseMarket {
-	case "futures":
-		manager = NewOrderManager(apiKey, secretKey)
-	case "spot":
-		manager = NewOrderManager(apiKey, secretKey) // Используем разные базовые URL внутри OrderManager
-	default:
-		log.Printf("MarketDepthWatcher: ERROR: Unsupported close market: %s", signal.CloseMarket)
-		return
-	}
-
-	// --- ОПРЕДЕЛЕНИЕ СТОРОНЫ ЗАКРЫТИЯ ---
-	// OriginalSide - это сторона заявки, которую мы отслеживали (ASK или BUY).
-	// Если мы отслеживали ASK (SELL), то, вероятно, кто-то открыл SHORT. Закрываем SHORT покупкой (BUY).
-	// Если мы отслеживали BID (BUY), то, вероятно, кто-то открыл LONG. Закрываем LONG продажей (SELL).
-	closeSide := "BUY" // Значение по умолчанию
-	switch signal.OriginalSide {
-	case "SELL": // Мы отслеживали A (ASK)
-		closeSide = "BUY" // Чтобы закрыть short, покупаем
-	case "BUY": // Мы отслеживали B (BID)
-		closeSide = "SELL" // Чтобы закрыть long, продаем
-	default:
-		log.Printf("MarketDepthWatcher: WARNING: Unknown OriginalSide '%s' for signal %d, defaulting to BUY", signal.OriginalSide, signal.ID)
-		// Можно оставить "BUY" или вернуть ошибку
-	}
-	// --- КОНЕЦ ОПРЕДЕЛЕНИЯ СТОРОНЫ ---
-
-	log.Printf("MarketDepthWatcher: INFO: Attempting to close FULL position for signal %d by placing %s order", signal.ID, closeSide)
-
-	// --- ИЗМЕРЕНИЕ LATENCY (от Binance EventTime до конца handleAutoClose) ---
-	startTime := time.Now()
-	// --- КОНЕЦ ИЗМЕРЕНИЯ ---
-
-	// --- ВЫЗОВ НОВОГО МЕТОДА ---
-	err = manager.CloseFullPosition(signal.Symbol, closeSide, signal.CloseMarket)
+	// Вызов нового метода CloseFullPosition (без side!)
+	err = manager.CloseFullPosition(signal.Symbol)
 	if err != nil {
 		log.Printf("MarketDepthWatcher: ERROR: CloseFullPosition failed for user %d: %v", signal.UserID, err)
 		return
 	}
-	// --- КОНЕЦ ВЫЗОВА ---
-	signal.AutoCloseExecuted = true
-
-	// --- ЛОГИРОВАНИЕ LATENCY ---
-	latencyFromBinanceEvent := time.Since(signal.BinanceEventTime) // от момента события на бирже до конца handleAutoClose
-	latencyFromTrigger := time.Since(signal.TriggerTime)           // от момента срабатывания триггера до конца handleAutoClose
-	latencyHandlerOnly := time.Since(startTime)                    // от начала handleAutoClose до конца
-	log.Printf("MarketDepthWatcher: Auto-close latency for signal %d:", signal.ID)
-	log.Printf("  - From Binance EventTime to end of handleAutoClose: %v", latencyFromBinanceEvent)
-	log.Printf("  - From TriggerTime to end of handleAutoClose: %v", latencyFromTrigger)
-	log.Printf("  - Time spent in handleAutoClose: %v", latencyHandlerOnly)
-	// --- КОНЕЦ ЛОГИРОВАНИЯ ---
 
 	log.Printf("MarketDepthWatcher: SUCCESS: FULL Position closed for user %d on %s", signal.UserID, signal.CloseMarket)
 }
