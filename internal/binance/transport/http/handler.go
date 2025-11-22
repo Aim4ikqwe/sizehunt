@@ -139,38 +139,44 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Handler: CreateSignal called for user %d, symbol %s, price %.8f", userID, req.Symbol, req.TargetPrice)
 
-	// Получаем userID из JWT
-	userIDFromContext := r.Context().Value(middleware.UserIDKey).(int64)
-	// Получаем API-ключи пользователя для HTTP-запроса
-	keys, err := h.KeysRepo.GetKeys(userIDFromContext)
+	// Проверяем подписку
+	subscribed, err := h.SubscriptionService.IsUserSubscribed(r.Context(), userID)
 	if err != nil {
-		log.Printf("Handler: GetKeys failed for user %d: %v", userIDFromContext, err)
+		log.Printf("Handler: IsUserSubscribed failed for user %d: %v", userID, err)
+		http.Error(w, "failed to check subscription", http.StatusInternalServerError)
+		return
+	}
+	if !subscribed {
+		http.Error(w, "subscription required", http.StatusForbidden)
+		return
+	}
+
+	// Получаем API-ключи пользователя
+	keys, err := h.KeysRepo.GetKeys(userID)
+	if err != nil {
+		log.Printf("Handler: GetKeys failed for user %d: %v", userID, err)
 		http.Error(w, "API keys not found", http.StatusUnauthorized)
 		return
 	}
+
 	// Расшифровываем ключи
 	secret := h.Config.EncryptionSecret
 	apiKey, err := service.DecryptAES(keys.APIKey, secret)
 	if err != nil {
-		log.Printf("Handler: DecryptAES failed for API key for user %d: %v", userIDFromContext, err)
+		log.Printf("Handler: DecryptAES failed for API key for user %d: %v", userID, err)
 		http.Error(w, "failed to decrypt API key", http.StatusInternalServerError)
 		return
 	}
-	// secretKey не нужен для публичного запроса GetOrderBook, но нужен для NewBinanceHTTPClient
-	// Получим и его
 	secretKey, err := service.DecryptAES(keys.SecretKey, secret)
 	if err != nil {
-		log.Printf("Handler: DecryptAES failed for Secret key for user %d: %v", userIDFromContext, err)
+		log.Printf("Handler: DecryptAES failed for Secret key for user %d: %v", userID, err)
 		http.Error(w, "failed to decrypt Secret key", http.StatusInternalServerError)
 		return
 	}
 
 	// Создаём HTTP-клиент для получения начального состояния
-	// Передаём оба ключа. secretKey нужен для NewBinanceHTTPClient, но не используется для GetOrderBook
 	client := service.NewBinanceHTTPClient(apiKey, secretKey)
-
-	// --- НОВАЯ ЛОГИКА: Получение начального состояния заявки ---
-	const initialBookLimit = 1000 // или другой разумный лимит
+	const initialBookLimit = 1000
 	ob, err := client.GetOrderBook(req.Symbol, initialBookLimit, req.Market)
 	if err != nil {
 		log.Printf("Handler: GetOrderBook failed for symbol %s, market %s: %v", req.Symbol, req.Market, err)
@@ -178,49 +184,41 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var initialQty float64 = 0         // Значение по умолчанию, если заявка не найдена
-	var initialSide string = "UNKNOWN" // Для информации - УБРАНО, не используется
-
-	// Ищем заявку в bids
+	var initialQty float64 = 0
+	var initialSide string = "UNKNOWN"
 	for _, bid := range ob.Bids {
 		if bid.Price == req.TargetPrice {
 			initialQty = bid.Quantity
 			initialSide = bid.Side
-			log.Printf("Handler: Found initial bid at %.8f with quantity %.4f for signal %s", req.TargetPrice, initialQty, req.Symbol)
+			log.Printf("Handler: Found initial bid at %.8f with quantity %.4f", req.TargetPrice, initialQty)
 			break
 		}
 	}
-
-	// Если не нашли в bids, ищем в asks
 	if initialQty == 0 {
 		for _, ask := range ob.Asks {
 			if ask.Price == req.TargetPrice {
 				initialQty = ask.Quantity
 				initialSide = ask.Side
-				log.Printf("Handler: Found initial ask at %.8f with quantity %.4f for signal %s", req.TargetPrice, initialQty, req.Symbol)
+				log.Printf("Handler: Found initial ask at %.8f with quantity %.4f", req.TargetPrice, initialQty)
 				break
 			}
 		}
 	}
 
-	// --- КОНЕЦ НОВОЙ ЛОГИКИ ---
-
-	// Проверяем, соответствует ли найденный объём минимальному
 	if initialQty < req.MinQuantity {
-		log.Printf("Handler: Initial quantity %.4f at price %.8f is less than min quantity %.4f for signal %s", initialQty, req.TargetPrice, req.MinQuantity, req.Symbol)
+		log.Printf("Handler: Initial quantity %.4f at price %.8f is less than min quantity %.4f", initialQty, req.TargetPrice, req.MinQuantity)
 		http.Error(w, fmt.Sprintf("initial quantity %.4f at price %.8f is less than min quantity %.4f", initialQty, req.TargetPrice, req.MinQuantity), http.StatusBadRequest)
 		return
 	}
 
-	// Получаем WebSocketWatcher
-	watcher, err := h.WebSocketManager.GetOrCreateWatcher(req.Symbol, req.Market)
+	// 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: используем мультиюзерный метод
+	watcher, err := h.WebSocketManager.GetOrCreateWatcherForUser(userID, req.Symbol, req.Market, req.AutoClose)
 	if err != nil {
-		log.Printf("Handler: Failed to get or create watcher for %s: %v", req.Symbol, err)
+		log.Printf("Handler: Failed to get watcher for user %d, symbol %s: %v", userID, req.Symbol, err)
 		http.Error(w, "failed to create watcher", http.StatusInternalServerError)
 		return
 	}
 
-	// Создаём сигнал
 	signal := &service.Signal{
 		ID:              generateID(),
 		UserID:          userID,
@@ -231,21 +229,17 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		TriggerOnEat:    req.TriggerOnEat,
 		EatPercentage:   req.EatPercentage,
 		AutoClose:       req.AutoClose,
-		CloseMarket:     req.CloseMarket, // Закрытие на том же рынке, где и мониторинг, если не указано иное
+		CloseMarket:     req.Market, // закрытие на том же рынке
 		WatchMarket:     req.Market,
-		// --- ИНИЦИАЛИЗАЦИЯ ORIGINAL QTY, LAST QTY, ORIGINAL SIDE ---
-		OriginalQty:  initialQty,
-		LastQty:      initialQty,
-		OriginalSide: initialSide, // Установим OriginalSide
-		// --- КОНЕЦ ИНИЦИАЛИЗАЦИИ ---
+		OriginalQty:     initialQty,
+		LastQty:         initialQty,
+		OriginalSide:    initialSide,
 	}
 
-	log.Printf("Handler: Adding signal %d to watcher for user %d, symbol %s, initialQty %.4f", signal.ID, signal.UserID, signal.Symbol, initialQty)
-
-	// Добавляем сигнал в watcher
+	log.Printf("Handler: Adding signal %d to watcher for user %d, symbol %s, initialQty %.4f", signal.ID, userID, req.Symbol, initialQty)
 	watcher.AddSignal(signal)
-
 	log.Printf("Handler: Signal %d created successfully for user %d", signal.ID, userID)
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"message":"signal created"}`))
 }

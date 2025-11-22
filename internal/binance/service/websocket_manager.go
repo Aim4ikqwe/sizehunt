@@ -13,15 +13,22 @@ import (
 	"github.com/adshao/go-binance/v2/futures"
 )
 
-type WebSocketManager struct {
+// UserWatcher holds watchers and streams per user
+type UserWatcher struct {
 	spotWatcher     *MarketDepthWatcher
 	futuresWatcher  *MarketDepthWatcher
-	mu              sync.RWMutex
-	subService      *subscriptionservice.Service
-	keysRepo        *repository.PostgresKeysRepo
-	cfg             *config.Config
-	positionWatcher *PositionWatcher
 	userDataStream  *UserDataStream
+	positionWatcher *PositionWatcher
+	futuresClient   *futures.Client
+}
+
+type WebSocketManager struct {
+	mu           sync.RWMutex
+	userWatchers map[int64]*UserWatcher // userID → watcher set
+	subService   *subscriptionservice.Service
+	keysRepo     *repository.PostgresKeysRepo
+	cfg          *config.Config
+	ctx          context.Context
 }
 
 func NewWebSocketManager(
@@ -30,64 +37,93 @@ func NewWebSocketManager(
 	keysRepo *repository.PostgresKeysRepo,
 	cfg *config.Config,
 ) *WebSocketManager {
-	// --- ИНИЦИАЛИЗАЦИЯ НОВЫХ КОМПОНЕНТОВ ---
-	// Получаем API-ключи пользователя 1 (или нужно для всех пользователей?)
-	// ВАЖНО: В текущей архитектуре это будет работать ТОЛЬКО для ОДНОГО пользователя (владельца ключей).
-	// Для мультиюзерности нужна отдельная логика (см. "Важное замечание" ниже).
-	userID := int64(8)                                            // <-- ВРЕМЕННО! Нужно брать из запроса или делать мультиюзерским
-	_, apiKey, secretKey := getKeysForUser(userID, keysRepo, cfg) // Реализуй эту функцию
-
-	futuresClient := futures.NewClient(apiKey, secretKey)
-	positionWatcher := NewPositionWatcher()
-	userDataStream := NewUserDataStream(futuresClient, positionWatcher)
-
-	// Запускаем User Data Stream
-	if err := userDataStream.Start(); err != nil {
-		log.Fatalf("Failed to start User Data Stream: %v", err)
+	return &WebSocketManager{
+		userWatchers: make(map[int64]*UserWatcher),
+		subService:   subService,
+		keysRepo:     keysRepo,
+		cfg:          cfg,
+		ctx:          ctx,
 	}
-	// --- КОНЕЦ ИНИЦИАЛИЗАЦИИ ---
-
-	manager := &WebSocketManager{
-		subService:      subService,
-		keysRepo:        keysRepo,
-		cfg:             cfg,
-		positionWatcher: positionWatcher,
-		userDataStream:  userDataStream,
-	}
-	// Создаём watchers, передавая новые зависимости
-	manager.spotWatcher = NewMarketDepthWatcher(ctx, "spot", subService, keysRepo, cfg, nil, nil, nil)
-	manager.futuresWatcher = NewMarketDepthWatcher(ctx, "futures", subService, keysRepo, cfg, futuresClient, positionWatcher, userDataStream)
-	return manager
 }
-func getKeysForUser(userID int64, keysRepo *repository.PostgresKeysRepo, cfg *config.Config) (bool, string, string) {
-	keys, err := keysRepo.GetKeys(userID)
+
+// GetOrCreateWatcherForUser возвращает SPOT или Futures watcher для пользователя
+func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, symbol, market string, autoClose bool) (*MarketDepthWatcher, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	userWatcher, exists := m.userWatchers[userID]
+	if !exists {
+		userWatcher = &UserWatcher{}
+		m.userWatchers[userID] = userWatcher
+	}
+
+	switch market {
+	case "spot":
+		if userWatcher.spotWatcher == nil {
+			userWatcher.spotWatcher = NewMarketDepthWatcher(
+				m.ctx, "spot", m.subService, m.keysRepo, m.cfg, nil, nil, nil,
+			)
+		}
+		return userWatcher.spotWatcher, nil
+
+	case "futures":
+		if userWatcher.futuresWatcher == nil {
+			// Нужны ключи для futures клиента и UserDataStream — но только если требуется автозакрытие
+			var futuresClient *futures.Client
+			var positionWatcher *PositionWatcher
+			var userDataStream *UserDataStream
+
+			if autoClose {
+				// Получаем и расшифровываем ключи
+				ok, apiKey, secretKey := m.getKeysForUser(userID)
+				if !ok {
+					return nil, fmt.Errorf("futures auto-close requires valid API keys")
+				}
+				futuresClient = futures.NewClient(apiKey, secretKey)
+				positionWatcher = NewPositionWatcher()
+				userDataStream = NewUserDataStream(futuresClient, positionWatcher)
+				if err := userDataStream.Start(); err != nil {
+					log.Printf("WebSocketManager: Failed to start UserDataStream for user %d: %v", userID, err)
+					return nil, fmt.Errorf("failed to start user data stream")
+				}
+			}
+			userWatcher.futuresClient = futuresClient
+			userWatcher.positionWatcher = positionWatcher
+			userWatcher.userDataStream = userDataStream
+
+			userWatcher.futuresWatcher = NewMarketDepthWatcher(
+				m.ctx,
+				"futures",
+				m.subService,
+				m.keysRepo,
+				m.cfg,
+				futuresClient,
+				positionWatcher,
+				userDataStream,
+			)
+		}
+		return userWatcher.futuresWatcher, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported market: %s", market)
+	}
+}
+
+func (m *WebSocketManager) getKeysForUser(userID int64) (bool, string, string) {
+	keys, err := m.keysRepo.GetKeys(userID)
 	if err != nil {
 		log.Printf("WebSocketManager: Failed to get keys for user %d: %v", userID, err)
 		return false, "", ""
 	}
-	secret := cfg.EncryptionSecret
-	apiKey, err := DecryptAES(keys.APIKey, secret)
+	apiKey, err := DecryptAES(keys.APIKey, m.cfg.EncryptionSecret)
 	if err != nil {
 		log.Printf("WebSocketManager: Failed to decrypt API key for user %d: %v", userID, err)
 		return false, "", ""
 	}
-	secretKey, err := DecryptAES(keys.SecretKey, secret)
+	secretKey, err := DecryptAES(keys.SecretKey, m.cfg.EncryptionSecret)
 	if err != nil {
 		log.Printf("WebSocketManager: Failed to decrypt Secret key for user %d: %v", userID, err)
 		return false, "", ""
 	}
 	return true, apiKey, secretKey
-}
-
-func (m *WebSocketManager) GetOrCreateWatcher(symbol string, market string) (*MarketDepthWatcher, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	switch market {
-	case "spot":
-		return m.spotWatcher, nil
-	case "futures":
-		return m.futuresWatcher, nil
-	default:
-		return nil, fmt.Errorf("unsupported market: %s", market)
-	}
 }
