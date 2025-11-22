@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
+	"time"
 
 	"github.com/adshao/go-binance/v2"
 	"github.com/adshao/go-binance/v2/futures"
@@ -27,13 +29,17 @@ type UnifiedDepthEvent struct {
 }
 
 type WebSocketClient struct {
-	OnData func(data *UnifiedDepthStreamData)
-	stopC  chan struct{}
-	doneC  <-chan struct{}
+	OnData   func(data *UnifiedDepthStreamData)
+	stopC    chan struct{}
+	doneC    <-chan struct{}
+	mu       sync.Mutex // Для защиты доступа к stopC и doneC
+	isClosed bool       // Флаг, что соединение уже закрыто
 }
 
 func NewWebSocketClient() *WebSocketClient {
-	return &WebSocketClient{}
+	return &WebSocketClient{
+		isClosed: false,
+	}
 }
 
 // ConnectForSpotCombined использует binance.WsCombinedDepthServe для нескольких спотовых символов
@@ -140,11 +146,39 @@ func (w *WebSocketClient) ConnectForFuturesCombined(ctx context.Context, symbolL
 
 // Close закрывает соединение
 func (w *WebSocketClient) Close() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Если клиент уже закрыт - ничего не делаем
+	if w.isClosed {
+		log.Println("WebSocketClient: Attempt to close already closed connection")
+		return
+	}
+
+	// Закрываем stopC только если он еще открыт
 	if w.stopC != nil {
-		close(w.stopC)
+		select {
+		case <-w.stopC:
+			// Канал уже закрыт
+			log.Println("WebSocketClient: stopC channel already closed")
+		default:
+			close(w.stopC)
+			log.Println("WebSocketClient: stopC channel closed successfully")
+		}
+		w.stopC = nil
 	}
+
+	// Ждем завершения соединения с таймаутом
 	if w.doneC != nil {
-		<-w.doneC
-		log.Println("Combined WebSocket connection closed.")
+		select {
+		case <-w.doneC:
+			log.Println("Combined WebSocket connection closed cleanly.")
+		case <-time.After(3 * time.Second):
+			log.Println("WebSocketClient: Timeout waiting for connection to close")
+		}
+		w.doneC = nil
 	}
+
+	w.isClosed = true
+	log.Println("WebSocketClient: Connection successfully closed and marked as closed")
 }

@@ -70,6 +70,10 @@ func (m *WebSocketManager) cleanupOldWatcher(oldWatcher *MarketDepthWatcher, sym
 			oldWatcher.client.Close()
 			log.Printf("WebSocketManager: WebSocket client closed for symbol %s, user %d (took %v)", symbol, userID, time.Since(startTime))
 		}
+		if oldWatcher.client == nil {
+			log.Printf("WebSocketManager: Attempt to clean up watcher with nil client for symbol %s, user %d", symbol, userID)
+			return
+		}
 
 		// Удаляем все сигналы для символа
 		log.Printf("WebSocketManager: Removing all signals for symbol %s, user %d", symbol, userID)

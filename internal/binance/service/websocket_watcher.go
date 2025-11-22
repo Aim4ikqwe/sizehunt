@@ -415,7 +415,6 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		} else {
 			_ = ob.Bids[price]
 			ob.Bids[price] = qty
-
 		}
 	}
 
@@ -479,21 +478,19 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 					w.onTrigger(signal, order)
 				}
 
-				if signal.AutoClose {
-					log.Printf("MarketDepthWatcher: Signal %d: Calling handleAutoClose for cancel (async)", signal.ID)
-					go func(sig *Signal, ord *entity.Order) {
-						// Копируем необходимые данные, чтобы избежать гонок
-						s := &Signal{
-							ID:          sig.ID,
-							UserID:      sig.UserID,
-							Symbol:      sig.Symbol,
-							CloseMarket: sig.CloseMarket,
-						}
-						w.handleAutoClose(s, ord)
-					}(signal, order)
-				}
-
+				// 🔥 ВАЖНО: Сначала собираем ID для удаления
 				signalsToRemove = append(signalsToRemove, signal.ID)
+
+				// 🔥 ЗАТЕМ запускаем асинхронное закрытие позиции
+				if signal.AutoClose {
+					log.Printf("MarketDepthWatcher: Signal %d: Scheduling handleAutoClose for cancel (async, after signal removal)", signal.ID)
+					// Создаем копии данных для горутины
+					sigCopy := *signal
+					orderCopy := *order
+					go func() {
+						w.handleAutoClose(&sigCopy, &orderCopy)
+					}()
+				}
 				continue
 			}
 		}
@@ -528,20 +525,20 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 					w.onTrigger(signal, order)
 				}
 
-				if signal.AutoClose {
-					log.Printf("MarketDepthWatcher: Signal %d: Calling handleAutoClose for eat (async)", signal.ID)
-					go func(sig *Signal, ord *entity.Order) {
-						s := &Signal{
-							ID:          sig.ID,
-							UserID:      sig.UserID,
-							Symbol:      sig.Symbol,
-							CloseMarket: sig.CloseMarket,
-						}
-						w.handleAutoClose(s, ord)
-					}(signal, order)
-				}
-
+				// 🔥 ВАЖНО: Сначала собираем ID для удаления
 				signalsToRemove = append(signalsToRemove, signal.ID)
+
+				// 🔥 ЗАТЕМ запускаем асинхронное закрытие позиции
+				if signal.AutoClose {
+					log.Printf("MarketDepthWatcher: Signal %d: Scheduling handleAutoClose for eat (async, after signal removal)", signal.ID)
+					// Создаем копии данных для горутины
+					sigCopy := *signal
+					orderCopy := *order
+					go func() {
+						w.handleAutoClose(&sigCopy, &orderCopy)
+					}()
+				}
+				continue
 			}
 		}
 
@@ -562,14 +559,45 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		}
 	}
 
-	// Удаляем сигналы после цикла
+	// 🔥 КРИТИЧЕСКИ ВАЖНО: Удаляем все сработавшие сигналы ДО выхода из блокировки
 	for _, id := range signalsToRemove {
-		log.Printf("MarketDepthWatcher: Removing triggered signal %d", id)
-		w.RemoveSignal(id)
+		log.Printf("MarketDepthWatcher: Removing triggered signal %d immediately after trigger", id)
+		w.removeSignalByID(id)
 	}
 
 	log.Printf("MarketDepthWatcher: Depth update processing completed for %s. Removed %d signals.",
 		symbol, len(signalsToRemove))
+}
+
+// 🔥 НОВЫЙ МЕТОД: удаление сигнала по ID с полной очисткой ресурсов
+func (w *MarketDepthWatcher) removeSignalByID(id int64) {
+	for symbol, signals := range w.signalsBySymbol {
+		for i, signal := range signals {
+			if signal.ID == id {
+				// Удаляем сигнал из слайса
+				w.signalsBySymbol[symbol] = append(signals[:i], signals[i+1:]...)
+				log.Printf("MarketDepthWatcher: Signal %d completely removed from monitoring", id)
+
+				// Если больше нет сигналов для этого символа - очищаем ресурсы
+				if len(w.signalsBySymbol[symbol]) == 0 {
+					delete(w.signalsBySymbol, symbol)
+					delete(w.activeSymbols, symbol)
+					delete(w.orderBooks, symbol)
+					log.Printf("MarketDepthWatcher: All resources cleaned up for symbol %s after last signal removal", symbol)
+
+					// Если это был последний символ - останавливаем WebSocket
+					if len(w.activeSymbols) == 0 && w.client != nil {
+						log.Printf("MarketDepthWatcher: No active symbols left, closing WebSocket connection")
+						w.client.Close()
+						w.client = nil
+						w.started = false
+					}
+				}
+				return
+			}
+		}
+	}
+	log.Printf("MarketDepthWatcher: Signal %d not found for removal", id)
 }
 
 // findOrderAtPrice ищет заявку в локальном OrderBookMap по точному совпадению цены
@@ -625,8 +653,23 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 		log.Printf("MarketDepthWatcher: ERROR: CloseFullPosition failed for user %d: %v", signal.UserID, err)
 		return
 	}
+	endTime := time.Since(startTime)
+	log.Printf("MarketDepthWatcher: operation ended %v", endTime)
 
 	log.Printf("MarketDepthWatcher: SUCCESS: FULL Position closed for user %d on %s", signal.UserID, signal.CloseMarket)
+	// 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Останавливаем userDataStream после успешного закрытия позиции
+	if w.userDataStream != nil {
+		log.Printf("MarketDepthWatcher: Stopping UserDataStream after signal %d completion", signal.ID)
+
+		// Создаем контекст с таймаутом для остановки
+		stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		w.userDataStream.StopWithContext(stopCtx)
+		w.userDataStream = nil
+
+		log.Printf("MarketDepthWatcher: UserDataStream stopped successfully for user %d", signal.UserID)
+	}
 }
 
 func (w *MarketDepthWatcher) SetOnTrigger(fn func(signal *Signal, order *entity.Order)) {

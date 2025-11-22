@@ -264,11 +264,13 @@ func (u *UserDataStream) StopWithContext(ctx context.Context) {
 	defer cancel()
 
 	// Останавливаем keep-alive и другие горутины
+	u.mu.Lock()
 	if u.stopChan != nil {
 		close(u.stopChan)
 		u.stopChan = nil
 		log.Println("UserDataStream: Stop channel closed")
 	}
+	u.mu.Unlock()
 
 	// Закрываем WebSocket соединение
 	u.mu.Lock()
@@ -280,31 +282,43 @@ func (u *UserDataStream) StopWithContext(ctx context.Context) {
 	u.mu.Unlock()
 
 	// Удаляем listen key с таймаутом
+	u.mu.Lock()
 	if u.listenKey != "" {
 		log.Printf("UserDataStream: Deleting listen key: %s", u.listenKey)
+		listenKey := u.listenKey // сохраняем локальную копию
+		u.listenKey = ""
+		u.mu.Unlock()
 
 		delCtx, delCancel := context.WithTimeout(stopCtx, 2*time.Second)
 		defer delCancel()
 
-		err := u.futuresClient.NewCloseUserStreamService().ListenKey(u.listenKey).Do(delCtx)
+		err := u.futuresClient.NewCloseUserStreamService().ListenKey(listenKey).Do(delCtx)
 		if err != nil {
 			log.Printf("UserDataStream: WARNING: Failed to delete listen key: %v", err)
 		} else {
-			log.Printf("UserDataStream: Listen key %s deleted successfully", u.listenKey)
+			log.Printf("UserDataStream: Listen key %s deleted successfully", listenKey)
 		}
-
-		u.listenKey = ""
+	} else {
+		u.mu.Unlock()
 	}
 
 	// Ждем завершения в отдельной горутине с таймаутом
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		select {
-		case <-u.doneChan:
-			log.Println("UserDataStream: All background processes stopped")
-		case <-time.After(3 * time.Second):
-			log.Println("UserDataStream: WARNING: Background processes may still be running after timeout")
+		u.mu.Lock()
+		doneChan := u.doneChan
+		u.mu.Unlock()
+
+		if doneChan != nil {
+			select {
+			case <-doneChan:
+				log.Println("UserDataStream: All background processes stopped")
+			case <-time.After(3 * time.Second):
+				log.Println("UserDataStream: WARNING: Background processes may still be running after timeout")
+			}
+		} else {
+			log.Println("UserDataStream: No background processes to wait for")
 		}
 	}()
 
@@ -314,4 +328,12 @@ func (u *UserDataStream) StopWithContext(ctx context.Context) {
 	case <-stopCtx.Done():
 		log.Println("UserDataStream: Stop completed with context timeout")
 	}
+
+	// Дополнительная очистка - устанавливаем все каналы в nil
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.stopChan = nil
+	u.stopWsChan = nil
+	u.doneChan = nil
+	log.Println("UserDataStream: All resources cleaned up after stop")
 }
