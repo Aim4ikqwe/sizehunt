@@ -35,8 +35,7 @@ type Signal struct {
 	OriginalSide     string    // "BUY" или "SELL" - сторона заявки при создании
 	TriggerTime      time.Time // Время срабатывания триггера (установлено в processDepthUpdate)
 	BinanceEventTime time.Time // Время события на бирже (из WebSocket)
-	// --- КОНЕЦ ДОБАВЛЕННЫХ ПОЛЕЙ ---
-	AutoCloseExecuted bool
+
 }
 
 // OrderBookMap представляет локальный ордербук для одного символа
@@ -302,63 +301,57 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		return // Нет сигналов для этого символа
 	}
 	// Преобразуем EventTime из миллисекунд в time.Time
-	binanceEventTime := time.UnixMilli(data.Data.EventTime)
+
+	// Собираем ID сигналов, которые нужно удалить
+	signalsToRemove := []int64{}
 
 	for _, signal := range signalsForSymbol {
-		if signal.AutoCloseExecuted {
-			continue // Пропускаем сигнал, если автозакрытие уже выполнено
-		}
-		// log.Printf("MarketDepthWatcher: Checking signal %d for symbol %s at price %.8f, originalQty %.4f", signal.ID, signal.Symbol, signal.TargetPrice, signal.OriginalQty) // <-- УБРАНО
-		found, currentQty := w.findOrderAtPrice(ob, signal.TargetPrice)
-		// log.Printf("MarketDepthWatcher: Signal %d: findOrderAtPrice returned found=%v, currentQty=%.4f", signal.ID, found, currentQty) // <-- УБРАНО
 
-		// Проверка на отмену (disappeared)
+		binanceEventTime := time.UnixMilli(data.Data.EventTime)
+		found, currentQty := w.findOrderAtPrice(ob, signal.TargetPrice)
+
+		// Проверка на отмену
 		if signal.TriggerOnCancel {
-			if !found {
-				// Если заявка исчезла (не найдена), и она была изначально (OriginalQty > 0)
-				// Или, если она исчезла, когда была (LastQty > 0)
-				// Лучше проверить OriginalQty, т.к. LastQty обновляется.
-				// Если OriginalQty > 0, и сейчас !found, это отмена.
-				if signal.OriginalQty > 0 {
-					triggerTime := time.Now() // ЗАПИСЬ ВРЕМЕНИ СРАБАТЫВАНИЯ ТРИГГЕРА
-					signal.TriggerTime = triggerTime
-					signal.BinanceEventTime = binanceEventTime // <-- ЗАПИСЬ ВРЕМЕНИ СОБЫТИЯ НА БИРЖЕ
-					log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel at %v (Binance EventTime: %v)", signal.ID, signal.TargetPrice, signal.LastQty, triggerTime, binanceEventTime)
-					order := &entity.Order{
-						Price:    signal.TargetPrice,
-						Quantity: signal.LastQty, // Используем LastQty как "последний известный объём перед исчезновением"
-						Side:     "UNKNOWN",      // Сторона неизвестна
-					}
-					if w.onTrigger != nil {
-						w.onTrigger(signal, order)
-					}
-					if signal.AutoClose {
-						log.Printf("MarketDepthWatcher: Signal %d: Calling handleAutoClose for cancel", signal.ID)
-						w.handleAutoClose(signal, order)
-						signal.AutoCloseExecuted = true
-					}
-					continue // Переходим к следующему сигналу, т.к. этот сработал
+			if !found && signal.OriginalQty > 0 {
+				triggerTime := time.Now()
+				signal.TriggerTime = triggerTime
+				signal.BinanceEventTime = binanceEventTime
+				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel at %v", signal.ID, signal.TargetPrice, signal.LastQty, triggerTime)
+
+				order := &entity.Order{
+					Price:    signal.TargetPrice,
+					Quantity: signal.LastQty,
+					Side:     "UNKNOWN",
 				}
+				if w.onTrigger != nil {
+					w.onTrigger(signal, order)
+				}
+				if signal.AutoClose {
+					log.Printf("MarketDepthWatcher: Signal %d: Calling handleAutoClose for cancel", signal.ID)
+					w.handleAutoClose(signal, order)
+				}
+				signalsToRemove = append(signalsToRemove, signal.ID)
+				continue
 			}
 		}
 
-		// Проверка на поедание (eaten)
+		// Проверка на разъедание
 		if signal.TriggerOnEat && found {
-			// Только если заявка найдена
 			eaten := signal.OriginalQty - currentQty
 			eatenPercentage := 0.0
 			if signal.OriginalQty > 0 {
 				eatenPercentage = eaten / signal.OriginalQty
 			}
 			if eatenPercentage >= signal.EatPercentage {
-				triggerTime := time.Now() // ЗАПИСЬ ВРЕМЕНИ СРАБАТЫВАНИЯ ТРИГГЕРА
+				triggerTime := time.Now()
 				signal.TriggerTime = triggerTime
-				signal.BinanceEventTime = binanceEventTime // <-- ЗАПИСЬ ВРЕМЕНИ СОБЫТИЯ НА БИРЖЕ
-				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat at %v (Binance EventTime: %v)", signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty, triggerTime, binanceEventTime)
+				signal.BinanceEventTime = binanceEventTime
+				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat at %v", signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty, triggerTime)
+
 				order := &entity.Order{
 					Price:    signal.TargetPrice,
 					Quantity: currentQty,
-					Side:     "UNKNOWN", // Сторона неизвестна
+					Side:     "UNKNOWN",
 				}
 				if w.onTrigger != nil {
 					w.onTrigger(signal, order)
@@ -367,21 +360,19 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 					log.Printf("MarketDepthWatcher: Signal %d: Calling handleAutoClose for eat", signal.ID)
 					w.handleAutoClose(signal, order)
 				}
+				signalsToRemove = append(signalsToRemove, signal.ID)
 			}
 		}
-		// Обновляем LastQty, если заявка была найдена
+
+		// Обновляем LastQty, если заявка найдена
 		if found {
 			signal.LastQty = currentQty
-			// log.Printf("MarketDepthWatcher: Signal %d: Updated LastQty to %.4f", signal.ID, currentQty) // <-- УБРАНО
-		} else {
-			// Если не найдена, но была, LastQty можно не обновлять, или обновить на 0?
-			// В текущей логике, если !found, LastQty не обновляется.
-			// Это может быть проблемой, если заявка исчезает.
-			// Но срабатывание на cancel обрабатывает это.
-			// Возможно, стоит обновить на 0, если !found и была раньше.
-			// signal.LastQty = 0 // Это может сбить с толку, если !found, но OriginalQty > 0.
-			// Оставим как есть, обновляем только если found.
 		}
+	}
+
+	// Удаляем сигналы после цикла
+	for _, id := range signalsToRemove {
+		w.RemoveSignal(id)
 	}
 }
 
