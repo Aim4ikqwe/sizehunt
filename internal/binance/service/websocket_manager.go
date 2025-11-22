@@ -18,14 +18,13 @@ import (
 type UserWatcher struct {
 	spotWatchers    map[string]*MarketDepthWatcher
 	futuresWatchers map[string]*MarketDepthWatcher
-
 	// Общие для пользователя ресурсы (futures)
 	futuresClient   *futures.Client
 	positionWatcher *PositionWatcher
 	userDataStream  *UserDataStream
-
 	// флаг, что userDataStream запущен
 	userDataStreamStarted bool
+	mu                    sync.Mutex // локальный мьютекс для UserWatcher
 }
 
 type WebSocketManager struct {
@@ -43,84 +42,168 @@ func NewWebSocketManager(
 	keysRepo *repository.PostgresKeysRepo,
 	cfg *config.Config,
 ) *WebSocketManager {
-	return &WebSocketManager{
+	manager := &WebSocketManager{
 		userWatchers: make(map[int64]*UserWatcher),
 		subService:   subService,
 		keysRepo:     keysRepo,
 		cfg:          cfg,
 		ctx:          ctx,
 	}
+
+	log.Println("WebSocketManager: Initialized successfully")
+	return manager
+}
+
+// cleanupOldWatcher асинхронно закрывает старый watcher и освобождает ресурсы
+func (m *WebSocketManager) cleanupOldWatcher(oldWatcher *MarketDepthWatcher, symbol string, userID int64) {
+	if oldWatcher == nil {
+		return
+	}
+
+	go func() {
+		startTime := time.Now()
+		log.Printf("WebSocketManager: Starting async cleanup for symbol %s, user %d", symbol, userID)
+
+		// Закрываем WebSocket соединение с таймаутом
+		if oldWatcher.client != nil {
+			log.Printf("WebSocketManager: Closing WebSocket client for symbol %s, user %d", symbol, userID)
+			oldWatcher.client.Close()
+			log.Printf("WebSocketManager: WebSocket client closed for symbol %s, user %d (took %v)", symbol, userID, time.Since(startTime))
+		}
+
+		// Удаляем все сигналы для символа
+		log.Printf("WebSocketManager: Removing all signals for symbol %s, user %d", symbol, userID)
+		oldWatcher.RemoveAllSignalsForSymbol(symbol)
+		log.Printf("WebSocketManager: All signals removed for symbol %s, user %d", symbol, userID)
+
+		log.Printf("WebSocketManager: Async cleanup completed for symbol %s, user %d (total time: %v)", symbol, userID, time.Since(startTime))
+	}()
 }
 
 // GetOrCreateWatcherForUser возвращает watcher для конкретного пользователя и символа.
-// Реализовано так, чтобы сетевые операции (Start userDataStream) выполнялись ВНЕ мьютекса.
+// Переписан для избежания блокировок при закрытии соединений
 func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, symbol, market string, autoClose bool) (*MarketDepthWatcher, error) {
-	// Флаги/объекты для старта вне мьютекса
-	var toStartUserData bool
-	var udStreamToStart *UserDataStream
+	startTime := time.Now()
+	log.Printf("WebSocketManager: GetOrCreateWatcherForUser called for user %d, symbol %s, market %s, autoClose %v",
+		userID, symbol, market, autoClose)
+	defer func() {
+		log.Printf("WebSocketManager: GetOrCreateWatcherForUser completed for user %d, symbol %s (total time: %v)",
+			userID, symbol, time.Since(startTime))
+	}()
 
-	// 1) Быстрая фаза под мьютексом: получить или создать UserWatcher и вернуть существующий watcher если есть.
+	// 1. Быстрая фаза под мьютексом: получить или создать UserWatcher
 	m.mu.Lock()
-	uw, ok := m.userWatchers[userID]
-	if !ok {
+	uw, exists := m.userWatchers[userID]
+	if !exists {
+		log.Printf("WebSocketManager: Creating new UserWatcher for user %d", userID)
 		uw = &UserWatcher{
 			spotWatchers:    make(map[string]*MarketDepthWatcher),
 			futuresWatchers: make(map[string]*MarketDepthWatcher),
 		}
 		m.userWatchers[userID] = uw
+	} else {
+		log.Printf("WebSocketManager: Found existing UserWatcher for user %d", userID)
 	}
+	m.mu.Unlock()
 
+	// 2. Работа с конкретным рынком
 	switch market {
 	case "spot":
-		// Если уже есть watcher для символа — вернуть
+		uw.mu.Lock()
+		defer uw.mu.Unlock()
+
+		// Проверяем существующий watcher
 		if w, exists := uw.spotWatchers[symbol]; exists && w != nil {
-			m.mu.Unlock()
+			log.Printf("WebSocketManager: Found existing spot watcher for user %d, symbol %s", userID, symbol)
 			return w, nil
 		}
-		// Создаём новый MarketDepthWatcher (он ещё не подключится до AddSignal)
-		w := NewMarketDepthWatcher(
+
+		// Создаем новый watcher
+		log.Printf("WebSocketManager: Creating new spot watcher for user %d, symbol %s", userID, symbol)
+		newWatcher := NewMarketDepthWatcher(
 			m.ctx, "spot", m.subService, m.keysRepo, m.cfg, nil, nil, nil,
 		)
-		uw.spotWatchers[symbol] = w
-		m.mu.Unlock()
-		return w, nil
+
+		uw.spotWatchers[symbol] = newWatcher
+
+		log.Printf("WebSocketManager: New spot watcher created for user %d, symbol %s", userID, symbol)
+		return newWatcher, nil
 
 	case "futures":
-		// Если уже есть watcher для символа — вернуть
+		// Используем локальный мьютекс для UserWatcher
+		uw.mu.Lock()
+		defer uw.mu.Unlock()
+
+		// Удаляем старый watcher если он существует
 		if w, exists := uw.futuresWatchers[symbol]; exists && w != nil {
-			m.mu.Unlock()
-			return w, nil
+			log.Printf("WebSocketManager: Found existing futures watcher for user %d, symbol %s - will be replaced", userID, symbol)
+			// Асинхронно очищаем старый watcher
+			m.cleanupOldWatcher(w, symbol, userID)
 		}
 
-		// Если требуется autoClose — убедимся, что у пользователя есть userDataStream и futuresClient.
+		// Если требуется autoClose - проверяем и инициализируем ресурсы
 		if autoClose {
-			// Если у нас ещё нет созданных общих объектов для этого пользователя — создаём их (но не стартуем stream)
-			if uw.userDataStream == nil {
-				// получаем ключи
-				okKeys, apiKey, secretKey := m.getKeysForUser(userID)
-				if !okKeys {
-					m.mu.Unlock()
-					return nil, fmt.Errorf("futures auto-close requires valid API keys")
+			log.Printf("WebSocketManager: AutoClose enabled - checking/initializing futures resources for user %d", userID)
+
+			// Проверяем/пересоздаем userDataStream
+			if uw.userDataStream != nil {
+				log.Printf("WebSocketManager: Stopping existing userDataStream for user %d", userID)
+
+				// Создаем контекст с таймаутом для остановки
+				stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+
+				done := make(chan struct{})
+				go func() {
+					uw.userDataStream.StopWithContext(stopCtx)
+					close(done)
+				}()
+
+				select {
+				case <-done:
+					log.Printf("WebSocketManager: UserDataStream for user %d stopped cleanly", userID)
+				case <-time.After(3 * time.Second):
+					log.Printf("WebSocketManager: WARNING: Forced stop of UserDataStream for user %d after timeout", userID)
 				}
-				uw.futuresClient = futures.NewClient(apiKey, secretKey)
-				uw.positionWatcher = NewPositionWatcher()
-				uw.userDataStream = NewUserDataStream(uw.futuresClient, uw.positionWatcher)
+
+				uw.userDataStream = nil
+				uw.futuresClient = nil
+				uw.positionWatcher = nil
 				uw.userDataStreamStarted = false
-				// пометим, что нужно стартовать UserDataStream после выхода из мьютекса
-				toStartUserData = true
-				udStreamToStart = uw.userDataStream
 			}
-			// если userDataStream уже есть, но не стартован — пометим для старта
-			if uw.userDataStream != nil && !uw.userDataStreamStarted {
-				toStartUserData = true
-				udStreamToStart = uw.userDataStream
+
+			// Получаем ключи пользователя
+			okKeys, apiKey, secretKey := m.getKeysForUser(userID)
+			if !okKeys {
+				log.Printf("WebSocketManager: ERROR: Failed to get valid API keys for user %d", userID)
+				return nil, fmt.Errorf("futures auto-close requires valid API keys")
 			}
-		} else {
-			// Если autoClose == false — можем оставить futuresClient nil (MarketDepthWatcher может работать без него)
+
+			// Создаем новые ресурсы
+			log.Printf("WebSocketManager: Creating new futures client for user %d", userID)
+			uw.futuresClient = futures.NewClient(apiKey, secretKey)
+			uw.positionWatcher = NewPositionWatcher()
+			uw.userDataStream = NewUserDataStream(uw.futuresClient, uw.positionWatcher)
+			uw.userDataStreamStarted = false
+			log.Printf("WebSocketManager: New futures resources created for user %d", userID)
+
+			// 🔥 КРИТИЧЕСКИ ВАЖНО: Запускаем UserDataStream для получения позиций
+			log.Printf("WebSocketManager: Starting UserDataStream for user %d", userID)
+			if err := uw.userDataStream.Start(); err != nil {
+				log.Printf("WebSocketManager: ERROR: Failed to start UserDataStream for user %d: %v", userID, err)
+				// Откатываем созданные ресурсы
+				uw.futuresClient = nil
+				uw.positionWatcher = nil
+				uw.userDataStream = nil
+				return nil, fmt.Errorf("failed to start user data stream: %w", err)
+			}
+			uw.userDataStreamStarted = true
+			log.Printf("WebSocketManager: UserDataStream successfully started for user %d", userID)
 		}
 
-		// Создаём futures watcher для данного символа, передаём общие структуры (возможно nil)
-		w := NewMarketDepthWatcher(
+		// Создаем новый watcher
+		log.Printf("WebSocketManager: Creating new futures watcher for user %d, symbol %s", userID, symbol)
+		newWatcher := NewMarketDepthWatcher(
 			m.ctx,
 			"futures",
 			m.subService,
@@ -130,71 +213,103 @@ func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, symbol, marke
 			uw.positionWatcher,
 			uw.userDataStream,
 		)
-		uw.futuresWatchers[symbol] = w
 
-		// Сохраняем локальную ссылку и выходим из мьютекса
-		m.mu.Unlock()
+		uw.futuresWatchers[symbol] = newWatcher
 
-		// 2) Стартап UserDataStream (если требуется) — ОБЯЗАТЕЛЬНО ВНЕ мьютекса
-		if toStartUserData && udStreamToStart != nil {
-			// даём разумный таймаут старта, чтобы не повесить обработчик
-			startCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			// note: текущая сигнатура Start() не принимает ctx, но мы оставляем шаблон/таймаут на случай расширения
-			_ = startCtx
-			defer cancel()
-
-			if err := udStreamToStart.Start(); err != nil {
-				// если старт не удался — логируем и корректно откорректируем состояние под мьютексом
-				log.Printf("WebSocketManager: Failed to start UserDataStream for user %d: %v", userID, err)
-				// откатим создание watcher'а — безопасно под мьютексом
-				m.mu.Lock()
-				// удаляем только этот watcher; остальные могут остаться
-				if uw2, ok2 := m.userWatchers[userID]; ok2 {
-					delete(uw2.futuresWatchers, symbol)
-				}
-				// если userDataStream был создан нами и он не стартовал — сбросим его, чтобы попытать снова позже
-				uw.futuresClient = nil
-				uw.positionWatcher = nil
-				uw.userDataStream = nil
-				uw.userDataStreamStarted = false
-				m.mu.Unlock()
-
-				return nil, fmt.Errorf("failed to start user data stream: %w", err)
-			}
-
-			// пометить, что stream запущен
-			m.mu.Lock()
-			if uw3, ok3 := m.userWatchers[userID]; ok3 {
-				uw3.userDataStreamStarted = true
-			}
-			m.mu.Unlock()
-		}
-
-		// возвращаем созданный watcher
-		return w, nil
+		log.Printf("WebSocketManager: New futures watcher created for user %d, symbol %s", userID, symbol)
+		return newWatcher, nil
 
 	default:
-		m.mu.Unlock()
+		log.Printf("WebSocketManager: ERROR: Unsupported market type: %s", market)
 		return nil, fmt.Errorf("unsupported market: %s", market)
 	}
 }
 
-// getKeysForUser — оставил как в оригинале
+// getKeysForUser — получает и расшифровывает ключи пользователя
 func (m *WebSocketManager) getKeysForUser(userID int64) (bool, string, string) {
+	startTime := time.Now()
+	defer func() {
+		log.Printf("WebSocketManager: getKeysForUser for user %d took %v", userID, time.Since(startTime))
+	}()
+
+	log.Printf("WebSocketManager: Getting API keys for user %d", userID)
 	keys, err := m.keysRepo.GetKeys(userID)
 	if err != nil {
-		log.Printf("WebSocketManager: Failed to get keys for user %d: %v", userID, err)
+		log.Printf("WebSocketManager: ERROR: Failed to get keys for user %d: %v", userID, err)
 		return false, "", ""
 	}
+
+	log.Printf("WebSocketManager: Decrypting API key for user %d", userID)
 	apiKey, err := DecryptAES(keys.APIKey, m.cfg.EncryptionSecret)
 	if err != nil {
-		log.Printf("WebSocketManager: Failed to decrypt API key for user %d: %v", userID, err)
+		log.Printf("WebSocketManager: ERROR: Failed to decrypt API key for user %d: %v", userID, err)
 		return false, "", ""
 	}
+
+	log.Printf("WebSocketManager: Decrypting Secret key for user %d", userID)
 	secretKey, err := DecryptAES(keys.SecretKey, m.cfg.EncryptionSecret)
 	if err != nil {
-		log.Printf("WebSocketManager: Failed to decrypt Secret key for user %d: %v", userID, err)
+		log.Printf("WebSocketManager: ERROR: Failed to decrypt Secret key for user %d: %v", userID, err)
 		return false, "", ""
 	}
+
+	log.Printf("WebSocketManager: Successfully retrieved keys for user %d", userID)
 	return true, apiKey, secretKey
+}
+
+// CleanupUserResources очищает все ресурсы пользователя
+func (m *WebSocketManager) CleanupUserResources(userID int64) {
+	log.Printf("WebSocketManager: Starting cleanup for user %d", userID)
+	startTime := time.Now()
+	defer func() {
+		log.Printf("WebSocketManager: Cleanup completed for user %d (total time: %v)", userID, time.Since(startTime))
+	}()
+
+	m.mu.Lock()
+	uw, exists := m.userWatchers[userID]
+	if !exists {
+		m.mu.Unlock()
+		log.Printf("WebSocketManager: No resources found for user %d", userID)
+		return
+	}
+	delete(m.userWatchers, userID)
+	m.mu.Unlock()
+
+	if uw == nil {
+		return
+	}
+
+	// Очищаем спотовые watcher'ы
+	for symbol, watcher := range uw.spotWatchers {
+		log.Printf("WebSocketManager: Cleaning up spot watcher for user %d, symbol %s", userID, symbol)
+		m.cleanupOldWatcher(watcher, symbol, userID)
+	}
+
+	// Очищаем фьючерсные watcher'ы
+	for symbol, watcher := range uw.futuresWatchers {
+		log.Printf("WebSocketManager: Cleaning up futures watcher for user %d, symbol %s", userID, symbol)
+		m.cleanupOldWatcher(watcher, symbol, userID)
+	}
+
+	// Останавливаем userDataStream
+	if uw.userDataStream != nil {
+		log.Printf("WebSocketManager: Stopping userDataStream for user %d", userID)
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		done := make(chan struct{})
+		go func() {
+			uw.userDataStream.StopWithContext(stopCtx)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			log.Printf("WebSocketManager: UserDataStream stopped cleanly for user %d", userID)
+		case <-time.After(5 * time.Second):
+			log.Printf("WebSocketManager: WARNING: Forced stop of UserDataStream for user %d after timeout", userID)
+		}
+	}
+
+	log.Printf("WebSocketManager: All resources cleaned up for user %d", userID)
 }
