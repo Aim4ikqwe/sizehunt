@@ -655,6 +655,8 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 	}
 	endTime := time.Since(startTime)
 	log.Printf("MarketDepthWatcher: operation ended %v", endTime)
+	timeNow := time.Now()
+	log.Printf("timeNow: %v", timeNow)
 
 	log.Printf("MarketDepthWatcher: SUCCESS: FULL Position closed for user %d on %s", signal.UserID, signal.CloseMarket)
 	// 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Останавливаем userDataStream после успешного закрытия позиции
