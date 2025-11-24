@@ -199,18 +199,18 @@ func (w *MarketDepthWatcher) AddSignal(signal *Signal) {
 	}
 }
 
-func (w *MarketDepthWatcher) RemoveSignal(id int64) bool {
+func (w *MarketDepthWatcher) RemoveSignal(id int64) {
 	startTime := time.Now()
 	defer func() {
 		log.Printf("MarketDepthWatcher: RemoveSignal completed (total time: %v)", time.Since(startTime))
 	}()
-
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
 	w.lastActivityTime = time.Now()
 
-	// Ищем и удаляем сигнал по ID
+	w.removeSignalByIDLocked(id)
+}
+func (w *MarketDepthWatcher) removeSignalByIDLocked(id int64) {
 	for symbol, signals := range w.signalsBySymbol {
 		for i, signal := range signals {
 			if signal.ID == id {
@@ -218,24 +218,40 @@ func (w *MarketDepthWatcher) RemoveSignal(id int64) bool {
 				w.signalsBySymbol[symbol] = append(signals[:i], signals[i+1:]...)
 				log.Printf("MarketDepthWatcher: Removed signal %d for symbol %s", id, symbol)
 
-				// Если больше сигналов для этого символа нет, удаляем его из activeSymbols
+				// Если больше нет сигналов для этого символа - очищаем ВСЕ ресурсы
 				if len(w.signalsBySymbol[symbol]) == 0 {
-					delete(w.activeSymbols, symbol)
 					delete(w.signalsBySymbol, symbol)
-					delete(w.orderBooks, symbol)
-					log.Printf("MarketDepthWatcher: No more signals for symbol %s, removing from active symbols", symbol)
+					delete(w.activeSymbols, symbol)
+
+					// Очищаем ордербук для символа
+					if _, exists := w.orderBooks[symbol]; exists {
+						delete(w.orderBooks, symbol)
+						log.Printf("MarketDepthWatcher: Orderbook cleaned up for symbol %s", symbol)
+					}
+
+					log.Printf("MarketDepthWatcher: All signals removed for symbol %s, cleaning up resources", symbol)
+
+					// Если это был последний символ - останавливаем WebSocket
+					if len(w.activeSymbols) == 0 {
+						if w.client != nil {
+							log.Printf("MarketDepthWatcher: No active symbols left, closing WebSocket connection for market %s", w.market)
+							w.client.Close()
+							w.client = nil
+						}
+						w.started = false
+						log.Printf("MarketDepthWatcher: WebSocket connection closed and marked as not started")
+					} else {
+						log.Printf("MarketDepthWatcher: Still %d active symbols remaining", len(w.activeSymbols))
+					}
 				} else {
 					log.Printf("MarketDepthWatcher: Still %d signals remaining for symbol %s",
 						len(w.signalsBySymbol[symbol]), symbol)
 				}
-
-				return true
+				return
 			}
 		}
 	}
-
 	log.Printf("MarketDepthWatcher: WARNING: Signal %d not found for removal", id)
-	return false
 }
 
 // startConnection вызывается только один раз при добавлении первого символа
@@ -730,28 +746,18 @@ func (w *MarketDepthWatcher) RemoveAllSignalsForSymbol(symbol string) {
 		log.Printf("MarketDepthWatcher: RemoveAllSignalsForSymbol for %s completed (total time: %v)",
 			symbol, time.Since(startTime))
 	}()
-
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if signals, exists := w.signalsBySymbol[symbol]; exists {
 		log.Printf("MarketDepthWatcher: Removing %d signals for symbol %s", len(signals), symbol)
-
 		for _, sig := range signals {
-			log.Printf("MarketDepthWatcher: Removing old signal %d for symbol %s", sig.ID, symbol)
+			// Используем существующую логику удаления для каждого сигнала
+			w.removeSignalByIDLocked(sig.ID)
 		}
-
-		delete(w.signalsBySymbol, symbol)
+	} else {
+		log.Printf("MarketDepthWatcher: No signals found for symbol %s to remove", symbol)
 	}
-
-	delete(w.activeSymbols, symbol)
-
-	if _, exists := w.orderBooks[symbol]; exists {
-		log.Printf("MarketDepthWatcher: Removing orderbook for symbol %s", symbol)
-		delete(w.orderBooks, symbol)
-	}
-
-	log.Printf("MarketDepthWatcher: All resources cleaned up for symbol %s", symbol)
 }
 
 // GetStatus возвращает статус watcher'а для мониторинга

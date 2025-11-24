@@ -372,20 +372,46 @@ func (m *WebSocketManager) DeleteUserSignal(userID int64, signalID int64) error 
 		return fmt.Errorf("user not found")
 	}
 
+	// Блокируем UserWatcher для операции удаления
+	uw.mu.Lock()
+	defer uw.mu.Unlock()
+
 	// Ищем и удаляем в spot watchers
 	found := false
-	for _, watcher := range uw.spotWatchers {
-		if watcher.RemoveSignal(signalID) {
-			found = true
+	for symbol, watcher := range uw.spotWatchers {
+		watcher.mu.Lock()
+		// Проверяем наличие сигнала перед удалением
+		if signals, ok := watcher.signalsBySymbol[symbol]; ok {
+			for _, s := range signals {
+				if s.ID == signalID {
+					watcher.removeSignalByIDLocked(signalID)
+					found = true
+					break
+				}
+			}
+		}
+		watcher.mu.Unlock()
+		if found {
 			break
 		}
 	}
 
 	// Если не нашли в spot, ищем в futures
 	if !found {
-		for _, watcher := range uw.futuresWatchers {
-			if watcher.RemoveSignal(signalID) {
-				found = true
+		for symbol, watcher := range uw.futuresWatchers {
+			watcher.mu.Lock()
+			// Проверяем наличие сигнала перед удалением
+			if signals, ok := watcher.signalsBySymbol[symbol]; ok {
+				for _, s := range signals {
+					if s.ID == signalID {
+						watcher.removeSignalByIDLocked(signalID)
+						found = true
+						break
+					}
+				}
+			}
+			watcher.mu.Unlock()
+			if found {
 				break
 			}
 		}
