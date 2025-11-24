@@ -67,6 +67,7 @@ type MarketDepthWatcher struct {
 	userDataStream      *UserDataStream
 	creationTime        time.Time // время создания watcher'а
 	lastActivityTime    time.Time // время последней активности
+	signalRepository    binance_repository.SignalRepository
 }
 
 func NewMarketDepthWatcher(
@@ -78,6 +79,7 @@ func NewMarketDepthWatcher(
 	futuresClient *futures.Client,
 	positionWatcher *PositionWatcher,
 	userDataStream *UserDataStream,
+	signalRepo binance_repository.SignalRepository,
 ) *MarketDepthWatcher {
 	// Инициализируем мапы
 	signalsBySymbol := make(map[string][]*Signal)
@@ -102,6 +104,7 @@ func NewMarketDepthWatcher(
 		userDataStream:      userDataStream,
 		creationTime:        time.Now(),
 		lastActivityTime:    time.Now(),
+		signalRepository:    signalRepo,
 	}
 
 	log.Printf("MarketDepthWatcher: Created new watcher for market %s (creation time: %v)", market, watcher.creationTime)
@@ -113,6 +116,32 @@ func (w *MarketDepthWatcher) AddSignal(signal *Signal) {
 	defer func() {
 		log.Printf("MarketDepthWatcher: AddSignal completed (total time: %v)", time.Since(startTime))
 	}()
+	// Сначала сохраняем в БД
+	if w.signalRepository != nil {
+		signalDB := &binance_repository.SignalDB{
+			UserID:          signal.UserID,
+			Symbol:          signal.Symbol,
+			TargetPrice:     signal.TargetPrice,
+			MinQuantity:     signal.MinQuantity,
+			TriggerOnCancel: signal.TriggerOnCancel,
+			TriggerOnEat:    signal.TriggerOnEat,
+			EatPercentage:   signal.EatPercentage,
+			OriginalQty:     signal.OriginalQty,
+			LastQty:         signal.LastQty,
+			AutoClose:       signal.AutoClose,
+			CloseMarket:     signal.CloseMarket,
+			WatchMarket:     signal.WatchMarket,
+			OriginalSide:    signal.OriginalSide,
+			CreatedAt:       signal.CreatedAt,
+		}
+
+		if err := w.signalRepository.Save(context.Background(), signalDB); err != nil {
+			log.Printf("MarketDepthWatcher: ERROR: Failed to save signal to database: %v", err)
+		} else {
+			signal.ID = signalDB.ID
+			log.Printf("MarketDepthWatcher: Signal saved to database with ID %d", signal.ID)
+		}
+	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -596,26 +625,41 @@ func (w *MarketDepthWatcher) removeSignalByID(id int64) {
 				// Удаляем сигнал из слайса
 				w.signalsBySymbol[symbol] = append(signals[:i], signals[i+1:]...)
 				log.Printf("MarketDepthWatcher: Signal %d completely removed from monitoring", id)
+				go func() {
+					if w.signalRepository != nil {
+						signalDB := &binance_repository.SignalDB{
+							ID:       id,
+							IsActive: false,
+							LastQty:  signal.LastQty, // Сохраняем последнее состояние
+						}
 
-				// Если больше нет сигналов для этого символа - очищаем ресурсы
-				if len(w.signalsBySymbol[symbol]) == 0 {
-					delete(w.signalsBySymbol, symbol)
-					delete(w.activeSymbols, symbol)
-					delete(w.orderBooks, symbol)
-					log.Printf("MarketDepthWatcher: All resources cleaned up for symbol %s after last signal removal", symbol)
-
-					// Если это был последний символ - останавливаем WebSocket
-					if len(w.activeSymbols) == 0 && w.client != nil {
-						log.Printf("MarketDepthWatcher: No active symbols left, closing WebSocket connection")
-						w.client.Close()
-						w.client = nil
-						w.started = false
+						if err := w.signalRepository.Update(context.Background(), signalDB); err != nil {
+							log.Printf("MarketDepthWatcher: WARNING: Failed to update signal %d in database: %v", id, err)
+						} else {
+							log.Printf("MarketDepthWatcher: Signal %d deactivated in database", id)
+						}
 					}
-				}
-				return
+				}()
 			}
+			// Если больше нет сигналов для этого символа - очищаем ресурсы
+			if len(w.signalsBySymbol[symbol]) == 0 {
+				delete(w.signalsBySymbol, symbol)
+				delete(w.activeSymbols, symbol)
+				delete(w.orderBooks, symbol)
+				log.Printf("MarketDepthWatcher: All resources cleaned up for symbol %s after last signal removal", symbol)
+
+				// Если это был последний символ - останавливаем WebSocket
+				if len(w.activeSymbols) == 0 && w.client != nil {
+					log.Printf("MarketDepthWatcher: No active symbols left, closing WebSocket connection")
+					w.client.Close()
+					w.client = nil
+					w.started = false
+				}
+			}
+			return
 		}
 	}
+
 	log.Printf("MarketDepthWatcher: Signal %d not found for removal", id)
 }
 

@@ -19,12 +19,6 @@ services:
     volumes:
       - ./migrations:/migrations
     entrypoint: ["migrate"]
-    command:
-      - "-source"
-      - "file:///migrations"
-      - "-database"
-      - "postgres://sizehunt:sizehunt@postgres:5432/sizehunt?sslmode=disable"
-      - "up"
 
 volumes:
   postgres_data:

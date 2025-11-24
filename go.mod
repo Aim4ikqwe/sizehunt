@@ -12,6 +12,8 @@ require (
 	golang.org/x/crypto v0.44.0
 )
 
+require github.com/jmoiron/sqlx v1.4.0 // indirect
+
 require (
 	github.com/adshao/go-binance/v2 v2.8.7
 	github.com/bitly/go-simplejson v0.5.1 // indirect

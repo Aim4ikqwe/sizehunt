@@ -30,6 +30,7 @@ type Handler struct {
 	WebSocketManager    *service.WebSocketManager
 	SubscriptionService *subscriptionservice.Service
 	Server              *http.Server
+	SignalRepository    repository.SignalRepository
 }
 
 func NewBinanceHandler(
@@ -39,6 +40,7 @@ func NewBinanceHandler(
 	wsManager *service.WebSocketManager,
 	subService *subscriptionservice.Service,
 	server *http.Server,
+	signalRepo repository.SignalRepository,
 ) *Handler {
 	handler := &Handler{
 		BinanceService:      watcher,
@@ -47,6 +49,7 @@ func NewBinanceHandler(
 		WebSocketManager:    wsManager,
 		SubscriptionService: subService,
 		Server:              server,
+		SignalRepository:    signalRepo,
 	}
 	log.Println("BinanceHandler: Initialized successfully")
 	return handler
@@ -341,8 +344,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Handler: Watcher obtained successfully (took %v)", watcherDuration)
-	signal := &service.Signal{
-		ID:              generateID(),
+	signalDB := &repository.SignalDB{
 		UserID:          userID,
 		Symbol:          req.Symbol,
 		TargetPrice:     req.TargetPrice,
@@ -350,13 +352,36 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		TriggerOnCancel: req.TriggerOnCancel,
 		TriggerOnEat:    req.TriggerOnEat,
 		EatPercentage:   req.EatPercentage,
+		OriginalQty:     initialQty,
+		LastQty:         initialQty,
 		AutoClose:       req.AutoClose,
 		CloseMarket:     req.Market,
 		WatchMarket:     req.Market,
-		OriginalQty:     initialQty,
-		LastQty:         initialQty,
 		OriginalSide:    initialSide,
 		CreatedAt:       time.Now(),
+	}
+	// Сохраняем сигнал в БД
+	if err := h.SignalRepository.Save(r.Context(), signalDB); err != nil {
+		log.Printf("Handler: ERROR: Failed to save signal to database: %v", err)
+		http.Error(w, "failed to save signal", http.StatusInternalServerError)
+		return
+	}
+	signal := &service.Signal{
+		ID:              signalDB.ID,
+		UserID:          signalDB.UserID,
+		Symbol:          signalDB.Symbol,
+		TargetPrice:     signalDB.TargetPrice,
+		MinQuantity:     signalDB.MinQuantity,
+		TriggerOnCancel: signalDB.TriggerOnCancel,
+		TriggerOnEat:    signalDB.TriggerOnEat,
+		EatPercentage:   signalDB.EatPercentage,
+		OriginalQty:     signalDB.OriginalQty,
+		LastQty:         signalDB.LastQty,
+		AutoClose:       signalDB.AutoClose,
+		CloseMarket:     signalDB.CloseMarket,
+		WatchMarket:     signalDB.WatchMarket,
+		OriginalSide:    signalDB.OriginalSide,
+		CreatedAt:       signalDB.CreatedAt,
 	}
 	log.Printf("Handler: Adding signal %d to watcher for user %d, symbol %s, initialQty %.4f, side %s",
 		signal.ID, userID, req.Symbol, initialQty, initialSide)

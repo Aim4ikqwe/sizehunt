@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
+	"github.com/jmoiron/sqlx"
 
 	"sizehunt/internal/binance/repository"
 	binance_service "sizehunt/internal/binance/service"
@@ -49,14 +50,18 @@ func main() {
 
 	// Binance
 	keysRepo := repository.NewPostgresKeysRepo(database)
+	dbx := sqlx.NewDb(database, "postgres") // Конвертируем *sql.DB в *sqlx.DB
+	signalRepo := repository.NewPostgresSignalRepo(dbx)
 	binanceClient := binance_service.NewBinanceHTTPClient("", "") // Инициализируем без ключей
 	binanceWatcher := binance_service.NewWatcher(binanceClient)
 	subRepo := subscriptionrepository.NewSubscriptionRepository(database)
 	subService := subscriptionservice.NewService(subRepo)
+
 	wsManager := binance_service.NewWebSocketManager(
 		context.Background(),
 		subService,
 		keysRepo,
+		signalRepo,
 		cfg,
 	)
 
@@ -66,7 +71,7 @@ func main() {
 	}
 
 	// Передаем сервер в обработчик Binance
-	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager, subService, server)
+	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager, subService, server, signalRepo)
 	subHandler := subscriptionhttp.NewSubscriptionHandler(subService)
 
 	// --- РОУТЕР ---
