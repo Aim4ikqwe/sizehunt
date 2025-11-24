@@ -317,3 +317,132 @@ func (m *WebSocketManager) CleanupUserResources(userID int64) {
 
 	log.Printf("WebSocketManager: All resources cleaned up for user %d", userID)
 }
+
+// internal/binance/service/websocket_manager.go
+// ... существующий код ...
+
+// GetUserSignals возвращает все сигналы пользователя
+func (m *WebSocketManager) GetUserSignals(userID int64) []SignalResponse {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	uw, exists := m.userWatchers[userID]
+	if !exists {
+		return []SignalResponse{}
+	}
+
+	var signals []SignalResponse
+
+	// Собираем сигналы из spot watchers
+	for symbol, watcher := range uw.spotWatchers {
+		watcher.mu.RLock()
+		signalList := watcher.GetAllSignalsForSymbol(symbol)
+		watcher.mu.RUnlock()
+
+		for _, s := range signalList {
+			if s.UserID == userID {
+				signals = append(signals, convertSignalToResponse(s))
+			}
+		}
+	}
+
+	// Собираем сигналы из futures watchers
+	for symbol, watcher := range uw.futuresWatchers {
+		watcher.mu.RLock()
+		signalList := watcher.GetAllSignalsForSymbol(symbol)
+		watcher.mu.RUnlock()
+
+		for _, s := range signalList {
+			if s.UserID == userID {
+				signals = append(signals, convertSignalToResponse(s))
+			}
+		}
+	}
+
+	return signals
+}
+
+// DeleteUserSignal удаляет сигнал пользователя по ID
+func (m *WebSocketManager) DeleteUserSignal(userID int64, signalID int64) error {
+	m.mu.RLock()
+	uw, exists := m.userWatchers[userID]
+	m.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("user not found")
+	}
+
+	// Ищем и удаляем в spot watchers
+	found := false
+	for _, watcher := range uw.spotWatchers {
+		if watcher.RemoveSignal(signalID) {
+			found = true
+			break
+		}
+	}
+
+	// Если не нашли в spot, ищем в futures
+	if !found {
+		for _, watcher := range uw.futuresWatchers {
+			if watcher.RemoveSignal(signalID) {
+				found = true
+				break
+			}
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("signal not found")
+	}
+
+	return nil
+}
+
+func convertSignalToResponse(s *Signal) SignalResponse {
+	return SignalResponse{
+		ID:              s.ID,
+		Symbol:          s.Symbol,
+		TargetPrice:     s.TargetPrice,
+		MinQuantity:     s.MinQuantity,
+		TriggerOnCancel: s.TriggerOnCancel,
+		TriggerOnEat:    s.TriggerOnEat,
+		EatPercentage:   s.EatPercentage,
+		OriginalQty:     s.OriginalQty,
+		LastQty:         s.LastQty,
+		AutoClose:       s.AutoClose,
+		CloseMarket:     s.CloseMarket,
+		WatchMarket:     s.WatchMarket,
+		OriginalSide:    s.OriginalSide,
+		CreatedAt:       s.CreatedAt,
+	}
+}
+
+// SignalResponse структура для ответа API
+type SignalResponse struct {
+	ID              int64     `json:"id"`
+	Symbol          string    `json:"symbol"`
+	TargetPrice     float64   `json:"target_price"`
+	MinQuantity     float64   `json:"min_quantity"`
+	TriggerOnCancel bool      `json:"trigger_on_cancel"`
+	TriggerOnEat    bool      `json:"trigger_on_eat"`
+	EatPercentage   float64   `json:"eat_percentage"`
+	OriginalQty     float64   `json:"original_qty"`
+	LastQty         float64   `json:"last_qty"`
+	AutoClose       bool      `json:"auto_close"`
+	CloseMarket     string    `json:"close_market"`
+	WatchMarket     string    `json:"watch_market"`
+	OriginalSide    string    `json:"original_side"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+func (m *WebSocketManager) GetAllUserIDs() []int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	userIDs := make([]int64, 0, len(m.userWatchers))
+	for userID := range m.userWatchers {
+		userIDs = append(userIDs, userID)
+	}
+
+	return userIDs
+}

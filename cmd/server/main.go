@@ -4,10 +4,16 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/cors"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/cors"
+
 	"sizehunt/internal/binance/repository"
 	binance_service "sizehunt/internal/binance/service"
 	binancehttp "sizehunt/internal/binance/transport/http"
@@ -22,6 +28,8 @@ import (
 	"sizehunt/pkg/db"
 	"sizehunt/pkg/middleware"
 )
+
+var server *http.Server
 
 func main() {
 	fmt.Println("SizeHunt API starting...")
@@ -45,17 +53,14 @@ func main() {
 	keysRepo := repository.NewPostgresKeysRepo(database)
 	binanceClient := binance_service.NewBinanceHTTPClient("", "") // Инициализируем без ключей
 	binanceWatcher := binance_service.NewWatcher(binanceClient)
-
 	subRepo := subscriptionrepository.NewSubscriptionRepository(database)
 	subService := subscriptionservice.NewService(subRepo)
-
 	wsManager := binance_service.NewWebSocketManager(
 		context.Background(),
 		subService,
 		keysRepo,
 		cfg,
 	)
-
 	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager, subService)
 	subHandler := subscriptionhttp.NewSubscriptionHandler(subService)
 
@@ -87,10 +92,13 @@ func main() {
 
 		// Binance routes
 		pr.Get("/api/binance/book", binanceHandler.GetOrderBook)
-		pr.Get("/api/binance/order-at-price", binanceHandler.GetOrderAtPrice) // добавь
+		pr.Get("/api/binance/order-at-price", binanceHandler.GetOrderAtPrice)
 		pr.Post("/api/binance/keys", binanceHandler.SaveKeys)
 		pr.Delete("/api/binance/keys", binanceHandler.DeleteKeys)
 		pr.Post("/api/binance/signal", binanceHandler.CreateSignal)
+		pr.Get("/api/binance/signals", binanceHandler.GetSignals)
+		pr.Delete("/api/binance/signals/{id}", binanceHandler.DeleteSignal)
+		pr.Post("/api/binance/graceful-shutdown", binanceHandler.GracefulShutdown)
 
 		// Payment routes
 		pr.Post("/api/payment/create", subHandler.CreatePayment)
@@ -101,8 +109,38 @@ func main() {
 		w.Write([]byte("OK"))
 	})
 
+	server = &http.Server{
+		Addr:    ":8080",
+		Handler: r,
+	}
+
 	log.Println("Server running on :8080")
-	if err := http.ListenAndServe(":8080", r); err != nil {
+
+	// Graceful shutdown на сигналы ОС
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+
+		log.Println("Shutdown signal received, starting graceful shutdown")
+		shutdownServer()
+	}()
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+}
+
+func shutdownServer() {
+	log.Println("Starting server shutdown process")
+
+	// Создаем контекст с таймаутом
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Server shutdown failed: %v", err)
+	}
+
+	log.Println("Server stopped")
 }

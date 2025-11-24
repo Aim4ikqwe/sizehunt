@@ -199,7 +199,7 @@ func (w *MarketDepthWatcher) AddSignal(signal *Signal) {
 	}
 }
 
-func (w *MarketDepthWatcher) RemoveSignal(id int64) {
+func (w *MarketDepthWatcher) RemoveSignal(id int64) bool {
 	startTime := time.Now()
 	defer func() {
 		log.Printf("MarketDepthWatcher: RemoveSignal completed (total time: %v)", time.Since(startTime))
@@ -221,18 +221,21 @@ func (w *MarketDepthWatcher) RemoveSignal(id int64) {
 				// Если больше сигналов для этого символа нет, удаляем его из activeSymbols
 				if len(w.signalsBySymbol[symbol]) == 0 {
 					delete(w.activeSymbols, symbol)
+					delete(w.signalsBySymbol, symbol)
+					delete(w.orderBooks, symbol)
 					log.Printf("MarketDepthWatcher: No more signals for symbol %s, removing from active symbols", symbol)
 				} else {
 					log.Printf("MarketDepthWatcher: Still %d signals remaining for symbol %s",
 						len(w.signalsBySymbol[symbol]), symbol)
 				}
 
-				return
+				return true
 			}
 		}
 	}
 
 	log.Printf("MarketDepthWatcher: WARNING: Signal %d not found for removal", id)
+	return false
 }
 
 // startConnection вызывается только один раз при добавлении первого символа
@@ -786,4 +789,18 @@ func (w *MarketDepthWatcher) countTotalSignals() int {
 		total += len(signals)
 	}
 	return total
+}
+func (w *MarketDepthWatcher) GetAllSignalsForSymbol(symbol string) []*Signal {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	signals, exists := w.signalsBySymbol[symbol]
+	if !exists {
+		return []*Signal{}
+	}
+
+	// Создаем копию для безопасного возврата
+	result := make([]*Signal, len(signals))
+	copy(result, signals)
+	return result
 }
