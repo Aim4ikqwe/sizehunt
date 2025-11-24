@@ -193,7 +193,7 @@ func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, symbol, marke
 
 			// 🔥 КРИТИЧЕСКИ ВАЖНО: Запускаем UserDataStream для получения позиций
 			log.Printf("WebSocketManager: Starting UserDataStream for user %d", userID)
-			if err := uw.userDataStream.Start(); err != nil {
+			if err := uw.userDataStream.Start(symbol); err != nil {
 				log.Printf("WebSocketManager: ERROR: Failed to start UserDataStream for user %d: %v", userID, err)
 				// Откатываем созданные ресурсы
 				uw.futuresClient = nil

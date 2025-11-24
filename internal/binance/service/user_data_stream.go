@@ -34,7 +34,7 @@ func NewUserDataStream(client *futures.Client, watcher *PositionWatcher) *UserDa
 	}
 }
 
-func (u *UserDataStream) Start() error {
+func (u *UserDataStream) Start(symbol string) error {
 	// Проверяем, не остановлен ли поток
 	u.mu.Lock()
 	if u.isStopped {
@@ -42,7 +42,6 @@ func (u *UserDataStream) Start() error {
 		return fmt.Errorf("user data stream already stopped")
 	}
 	u.mu.Unlock()
-
 	// Создаем новый поток
 	keyStartTime := time.Now()
 	key, err := u.futuresClient.NewStartUserStreamService().Do(context.Background())
@@ -53,40 +52,50 @@ func (u *UserDataStream) Start() error {
 	log.Printf("UserDataStream: Listen key created successfully: %s (took %v)", key, time.Since(keyStartTime))
 	u.listenKey = key
 	u.lastAlive = time.Now()
-
-	// Инициализация позиций через REST
-	log.Println("UserDataStream: Initializing positions from REST API")
-	u.initializePositionsFromREST()
+	// Инициализация позиций через REST только для указанного символа
+	log.Printf("UserDataStream: Initializing position for symbol %s from REST API", symbol)
+	u.initializePositionsFromREST(symbol)
 	log.Println("UserDataStream: Positions initialization completed")
-
 	// Запускаем keep-alive в отдельной горутине
 	log.Println("UserDataStream: Starting keep-alive loop")
 	go u.keepAliveLoop()
-
 	// Запускаем WebSocket соединение
 	log.Println("UserDataStream: Starting WebSocket connection")
 	if err := u.runWs(); err != nil {
 		log.Printf("UserDataStream: ERROR: Failed to start WebSocket: %v", err)
 		return fmt.Errorf("failed to start WebSocket: %w", err)
 	}
-
 	log.Println("UserDataStream: Successfully started")
 	return nil
 }
 
-func (u *UserDataStream) initializePositionsFromREST() {
+func (u *UserDataStream) initializePositionsFromREST(symbol string) {
 	if u.watcher == nil {
 		log.Println("UserDataStream: WARNING: PositionWatcher is nil, skipping REST init")
 		return
 	}
 
-	resp, err := u.futuresClient.NewGetPositionRiskService().Do(context.Background())
-	if err != nil {
-		log.Printf("UserDataStream: ERROR: Failed to fetch positions from REST: %v", err)
-		return
+	var resp []*futures.PositionRisk
+	var err error
+
+	// Если указан конкретный символ, запрашиваем только его позицию
+	if symbol != "" {
+		resp, err = u.futuresClient.NewGetPositionRiskService().Symbol(symbol).Do(context.Background())
+		if err != nil {
+			log.Printf("UserDataStream: ERROR: Failed to fetch position for %s from REST: %v", symbol, err)
+			return
+		}
+		log.Printf("UserDataStream: Fetched position for single symbol %s from REST", symbol)
+	} else {
+		// Старый вариант - все позиции
+		resp, err = u.futuresClient.NewGetPositionRiskService().Do(context.Background())
+		if err != nil {
+			log.Printf("UserDataStream: ERROR: Failed to fetch positions from REST: %v", err)
+			return
+		}
+		log.Printf("UserDataStream: Found %d positions from REST", len(resp))
 	}
 
-	log.Printf("UserDataStream: Found %d positions from REST", len(resp))
 	for i, pos := range resp {
 		amt, err := strconv.ParseFloat(pos.PositionAmt, 64)
 		if err != nil {
@@ -94,7 +103,6 @@ func (u *UserDataStream) initializePositionsFromREST() {
 				pos.Symbol, pos.PositionAmt, err)
 			continue
 		}
-
 		if amt != 0 {
 			u.watcher.setPosition(pos.Symbol, amt)
 			log.Printf("UserDataStream: [%d/%d] Initialized %s position = %.6f from REST",
