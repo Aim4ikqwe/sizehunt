@@ -68,6 +68,7 @@ func (om *OrderManager) CloseFullPosition(symbol string) error {
 		Side(side).
 		Type(futures.OrderTypeMarket).
 		Quantity(qtyStr).
+		ReduceOnly(true).
 		NewOrderResponseType(futures.NewOrderRespTypeRESULT) // Получаем подробный ответ
 
 	orderStartTime := time.Now()
