@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"runtime/debug"
 	"sizehunt/internal/api/dto"
 	"sizehunt/internal/binance/entity"
@@ -28,6 +29,7 @@ type Handler struct {
 	Config              *config.Config
 	WebSocketManager    *service.WebSocketManager
 	SubscriptionService *subscriptionservice.Service
+	Server              *http.Server
 }
 
 func NewBinanceHandler(
@@ -36,6 +38,7 @@ func NewBinanceHandler(
 	cfg *config.Config,
 	wsManager *service.WebSocketManager,
 	subService *subscriptionservice.Service,
+	server *http.Server,
 ) *Handler {
 	handler := &Handler{
 		BinanceService:      watcher,
@@ -43,6 +46,7 @@ func NewBinanceHandler(
 		Config:              cfg,
 		WebSocketManager:    wsManager,
 		SubscriptionService: subService,
+		Server:              server,
 	}
 	log.Println("BinanceHandler: Initialized successfully")
 	return handler
@@ -560,9 +564,12 @@ func (h *Handler) GracefulShutdown(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 
 		log.Println("Initiating server shutdown")
-		if err := server.Shutdown(ctx); err != nil {
+		if err := h.Server.Shutdown(ctx); err != nil {
 			log.Printf("Server shutdown failed: %v", err)
 		}
+
+		// Выходим из приложения после успешного завершения
+		os.Exit(0)
 	}()
 }
 

@@ -29,8 +29,6 @@ import (
 	"sizehunt/pkg/middleware"
 )
 
-var server *http.Server
-
 func main() {
 	fmt.Println("SizeHunt API starting...")
 	cfg := config.Load()
@@ -61,7 +59,14 @@ func main() {
 		keysRepo,
 		cfg,
 	)
-	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager, subService)
+
+	// --- Создаем сервер ДО инициализации обработчиков ---
+	server := &http.Server{
+		Addr: ":8080",
+	}
+
+	// Передаем сервер в обработчик Binance
+	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager, subService, server)
 	subHandler := subscriptionhttp.NewSubscriptionHandler(subService)
 
 	// --- РОУТЕР ---
@@ -109,10 +114,8 @@ func main() {
 		w.Write([]byte("OK"))
 	})
 
-	server = &http.Server{
-		Addr:    ":8080",
-		Handler: r,
-	}
+	// Устанавливаем обработчик для сервера
+	server.Handler = r
 
 	log.Println("Server running on :8080")
 
@@ -123,7 +126,7 @@ func main() {
 		<-sig
 
 		log.Println("Shutdown signal received, starting graceful shutdown")
-		shutdownServer()
+		shutdownServer(server)
 	}()
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -131,7 +134,7 @@ func main() {
 	}
 }
 
-func shutdownServer() {
+func shutdownServer(server *http.Server) {
 	log.Println("Starting server shutdown process")
 
 	// Создаем контекст с таймаутом
