@@ -34,7 +34,7 @@ func NewUserDataStream(client *futures.Client, watcher *PositionWatcher) *UserDa
 	}
 }
 
-func (u *UserDataStream) Start(symbol string) error {
+func (u *UserDataStream) Start() error {
 	// Проверяем, не остановлен ли поток
 	u.mu.Lock()
 	if u.isStopped {
@@ -42,6 +42,7 @@ func (u *UserDataStream) Start(symbol string) error {
 		return fmt.Errorf("user data stream already stopped")
 	}
 	u.mu.Unlock()
+
 	// Создаем новый поток
 	keyStartTime := time.Now()
 	key, err := u.futuresClient.NewStartUserStreamService().Do(context.Background())
@@ -52,19 +53,18 @@ func (u *UserDataStream) Start(symbol string) error {
 	log.Printf("UserDataStream: Listen key created successfully: %s (took %v)", key, time.Since(keyStartTime))
 	u.listenKey = key
 	u.lastAlive = time.Now()
-	// Инициализация позиций через REST только для указанного символа
-	log.Printf("UserDataStream: Initializing position for symbol %s from REST API", symbol)
-	u.initializePositionsFromREST(symbol)
-	log.Println("UserDataStream: Positions initialization completed")
+
 	// Запускаем keep-alive в отдельной горутине
 	log.Println("UserDataStream: Starting keep-alive loop")
 	go u.keepAliveLoop()
+
 	// Запускаем WebSocket соединение
 	log.Println("UserDataStream: Starting WebSocket connection")
 	if err := u.runWs(); err != nil {
 		log.Printf("UserDataStream: ERROR: Failed to start WebSocket: %v", err)
 		return fmt.Errorf("failed to start WebSocket: %w", err)
 	}
+
 	log.Println("UserDataStream: Successfully started")
 	return nil
 }
@@ -344,4 +344,36 @@ func (u *UserDataStream) StopWithContext(ctx context.Context) {
 	u.stopWsChan = nil
 	u.doneChan = nil
 	log.Println("UserDataStream: All resources cleaned up after stop")
+}
+func (u *UserDataStream) initializePositionForSymbol(symbol string) error {
+	if u.watcher == nil {
+		log.Println("UserDataStream: WARNING: PositionWatcher is nil, skipping REST init")
+		return fmt.Errorf("position watcher is nil")
+	}
+
+	log.Printf("UserDataStream: Initializing position for symbol %s from REST API", symbol)
+	resp, err := u.futuresClient.NewGetPositionRiskService().Symbol(symbol).Do(context.Background())
+	if err != nil {
+		log.Printf("UserDataStream: ERROR: Failed to fetch position for %s from REST: %v", symbol, err)
+		return err
+	}
+
+	if len(resp) == 0 {
+		log.Printf("UserDataStream: No position found for symbol %s", symbol)
+		u.watcher.setPosition(symbol, 0)
+		return nil
+	}
+
+	// Обычно для одного символа будет только одна запись
+	pos := resp[0]
+	amt, err := strconv.ParseFloat(pos.PositionAmt, 64)
+	if err != nil {
+		log.Printf("UserDataStream: WARNING: Failed to parse position amount for %s (raw: %s): %v",
+			pos.Symbol, pos.PositionAmt, err)
+		return err
+	}
+
+	u.watcher.setPosition(pos.Symbol, amt)
+	log.Printf("UserDataStream: Initialized %s position = %.6f from REST", symbol, amt)
+	return nil
 }

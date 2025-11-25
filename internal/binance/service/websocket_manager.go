@@ -25,8 +25,9 @@ type UserWatcher struct {
 	userDataStream   *UserDataStream
 	signalRepository repository.SignalRepository
 	// флаг, что userDataStream запущен
-	userDataStreamStarted bool
-	mu                    sync.Mutex // локальный мьютекс для UserWatcher
+	userDataStreamStarted     bool
+	hasActiveAutoCloseSignals bool
+	mu                        sync.Mutex // локальный мьютекс для UserWatcher
 }
 
 type WebSocketManager struct {
@@ -167,9 +168,10 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 	if !exists {
 		log.Printf("WebSocketManager: Creating new UserWatcher for user %d", userID)
 		uw = &UserWatcher{
-			spotWatchers:     make(map[string]*MarketDepthWatcher),
-			futuresWatchers:  make(map[string]*MarketDepthWatcher),
-			signalRepository: m.signalRepo,
+			spotWatchers:              make(map[string]*MarketDepthWatcher),
+			futuresWatchers:           make(map[string]*MarketDepthWatcher),
+			signalRepository:          m.signalRepo,
+			hasActiveAutoCloseSignals: false,
 		}
 		m.userWatchers[userID] = uw
 	} else {
@@ -181,8 +183,13 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 	uw.mu.Lock()
 	defer uw.mu.Unlock()
 
-	var watcher *MarketDepthWatcher
+	// Обновляем флаг наличия активных auto-close сигналов
+	if autoClose {
+		uw.hasActiveAutoCloseSignals = true
+		log.Printf("WebSocketManager: User %d has active auto-close signals", userID)
+	}
 
+	var watcher *MarketDepthWatcher
 	switch market {
 	case "spot":
 		// Проверяем существующий watcher
@@ -190,14 +197,12 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 			log.Printf("WebSocketManager: Found existing spot watcher for user %d, symbol %s", userID, symbol)
 			return w, nil
 		}
-
 		// Создаем новый watcher (без инициализации соединения)
 		log.Printf("WebSocketManager: Creating new spot watcher for user %d, symbol %s", userID, symbol)
 		watcher = NewMarketDepthWatcher(
-			m.ctx, "spot", m.subService, m.keysRepo, m.cfg, nil, nil, nil, m.signalRepo,
+			m.ctx, "spot", m.subService, m.keysRepo, m.cfg, nil, nil, nil, m.signalRepo, m,
 		)
 		uw.spotWatchers[symbol] = watcher
-
 	case "futures":
 		// Удаляем старый watcher если он существует (асинхронно)
 		if w, exists := uw.futuresWatchers[symbol]; exists && w != nil {
@@ -212,7 +217,6 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 
 		if autoClose {
 			log.Printf("WebSocketManager: AutoClose enabled - preparing futures resources for user %d", userID)
-
 			// Получаем ключи пользователя
 			okKeys, apiKey, secretKey := m.getKeysForUser(userID)
 			if !okKeys {
@@ -220,28 +224,51 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 				return nil, fmt.Errorf("futures auto-close requires valid API keys")
 			}
 
-			// Создаем новые ресурсы
-			log.Printf("WebSocketManager: Creating new futures client for user %d", userID)
-			futuresClient = futures.NewClient(apiKey, secretKey)
-			positionWatcher = NewPositionWatcher()
+			// Создаем или используем существующие ресурсы
+			if uw.futuresClient == nil {
+				log.Printf("WebSocketManager: Creating new futures client for user %d", userID)
+				uw.futuresClient = futures.NewClient(apiKey, secretKey)
+				uw.positionWatcher = NewPositionWatcher()
+				uw.userDataStream = NewUserDataStream(uw.futuresClient, uw.positionWatcher)
 
-			// Инициализируем позиции через REST API в отдельной горутине
-			userDataStream = NewUserDataStream(futuresClient, positionWatcher)
-			go func() {
-				if err := userDataStream.Start(symbol); err != nil {
-					log.Printf("WebSocketManager: ERROR: Failed to start UserDataStream for user %d: %v", userID, err)
-				} else {
-					log.Printf("WebSocketManager: UserDataStream successfully started for user %d", userID)
+				// Инициализируем позиции для ВСЕХ активных сигналов пользователя
+				go func() {
+					// Получаем все активные сигналы пользователя
+					signals, err := m.signalRepo.GetActiveByUserID(context.Background(), userID)
+					if err != nil {
+						log.Printf("WebSocketManager: ERROR: Failed to get active signals for user %d: %v", userID, err)
+					} else {
+						// Собираем уникальные символы
+						symbols := make(map[string]bool)
+						for _, signal := range signals {
+							if signal.AutoClose && signal.WatchMarket == "futures" {
+								symbols[signal.Symbol] = true
+							}
+						}
 
-					// Обновляем флаг в безопасном режиме
-					uw.mu.Lock()
-					uw.userDataStreamStarted = true
-					uw.futuresClient = futuresClient
-					uw.positionWatcher = positionWatcher
-					uw.userDataStream = userDataStream
-					uw.mu.Unlock()
-				}
-			}()
+						// Инициализируем позиции для всех символов
+						for symbol := range symbols {
+							log.Printf("WebSocketManager: Initializing position for symbol %s from REST API", symbol)
+							if err := uw.userDataStream.initializePositionForSymbol(symbol); err != nil {
+								log.Printf("WebSocketManager: WARNING: Failed to initialize position for %s: %v", symbol, err)
+							}
+						}
+					}
+
+					// Запускаем UserDataStream
+					if err := uw.userDataStream.Start(); err != nil {
+						log.Printf("WebSocketManager: ERROR: Failed to start UserDataStream for user %d: %v", userID, err)
+					} else {
+						log.Printf("WebSocketManager: UserDataStream successfully started for user %d", userID)
+					}
+				}()
+			} else {
+				log.Printf("WebSocketManager: Using existing futures resources for user %d", userID)
+			}
+
+			futuresClient = uw.futuresClient
+			positionWatcher = uw.positionWatcher
+			userDataStream = uw.userDataStream
 		}
 
 		// Создаем новый watcher
@@ -256,23 +283,20 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 			positionWatcher,
 			userDataStream,
 			m.signalRepo,
+			m,
 		)
 		uw.futuresWatchers[symbol] = watcher
-
 	default:
 		log.Printf("WebSocketManager: ERROR: Unsupported market type: %s", market)
 		return nil, fmt.Errorf("unsupported market: %s", market)
 	}
-
 	log.Printf("WebSocketManager: New watcher created for user %d, symbol %s, market %s", userID, symbol, market)
-
 	// 3. Запускаем соединение асинхронно
 	go func() {
 		if err := watcher.StartConnection(); err != nil {
 			log.Printf("WebSocketManager: ERROR: Failed to start connection for user %d, symbol %s: %v", userID, symbol, err)
 		}
 	}()
-
 	return watcher, nil
 }
 
@@ -569,4 +593,53 @@ func (m *WebSocketManager) GetAllUserIDs() []int64 {
 		userIDs = append(userIDs, userID)
 	}
 	return userIDs
+}
+func (m *WebSocketManager) CheckAndStopUserDataStream(userID int64) {
+	log.Printf("WebSocketManager: Checking if UserDataStream needs to be stopped for user %d", userID)
+
+	m.mu.RLock()
+	uw, exists := m.userWatchers[userID]
+	m.mu.RUnlock()
+
+	if !exists || uw == nil {
+		log.Printf("WebSocketManager: UserWatcher not found for user %d", userID)
+		return
+	}
+
+	uw.mu.Lock()
+	defer uw.mu.Unlock()
+
+	// Проверяем, есть ли еще активные сигналы с autoClose
+	hasActiveAutoClose := false
+
+	// Проверяем все сигналы во всех watcher'ах
+	for _, watcher := range uw.futuresWatchers {
+		signals := watcher.GetAllSignals()
+		for _, signal := range signals {
+			if signal.AutoClose {
+				log.Printf("WebSocketManager: Found active auto-close signal %d for user %d", signal.ID, userID)
+				hasActiveAutoClose = true
+				break
+			}
+		}
+		if hasActiveAutoClose {
+			break
+		}
+	}
+
+	// Если нет активных сигналов с autoClose и есть userDataStream, останавливаем его
+	if !hasActiveAutoClose && uw.userDataStream != nil {
+		log.Printf("WebSocketManager: No active auto-close signals for user %d, stopping UserDataStream", userID)
+		stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		uw.userDataStream.StopWithContext(stopCtx)
+		uw.userDataStream = nil
+		uw.futuresClient = nil
+		uw.positionWatcher = nil
+		log.Printf("WebSocketManager: UserDataStream stopped for user %d", userID)
+	} else if hasActiveAutoClose {
+		log.Printf("WebSocketManager: User %d still has active auto-close signals, keeping UserDataStream active", userID)
+	} else {
+		log.Printf("WebSocketManager: No UserDataStream to stop for user %d", userID)
+	}
 }

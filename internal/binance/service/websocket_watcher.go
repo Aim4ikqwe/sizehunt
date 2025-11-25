@@ -68,6 +68,7 @@ type MarketDepthWatcher struct {
 	creationTime        time.Time // время создания watcher'а
 	lastActivityTime    time.Time // время последней активности
 	signalRepository    binance_repository.SignalRepository
+	WebSocketManager    *WebSocketManager
 }
 
 func NewMarketDepthWatcher(
@@ -80,6 +81,7 @@ func NewMarketDepthWatcher(
 	positionWatcher *PositionWatcher,
 	userDataStream *UserDataStream,
 	signalRepo binance_repository.SignalRepository,
+	wsManager *WebSocketManager,
 ) *MarketDepthWatcher {
 	// Инициализируем мапы
 	signalsBySymbol := make(map[string][]*Signal)
@@ -105,6 +107,7 @@ func NewMarketDepthWatcher(
 		creationTime:        time.Now(),
 		lastActivityTime:    time.Now(),
 		signalRepository:    signalRepo,
+		WebSocketManager:    wsManager,
 	}
 
 	log.Printf("MarketDepthWatcher: Created new watcher for market %s (creation time: %v)", market, watcher.creationTime)
@@ -663,29 +666,23 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 		log.Printf("MarketDepthWatcher: handleAutoClose for signal %d completed (total time: %v)",
 			signal.ID, time.Since(startTime))
 	}()
-
 	if signal.CloseMarket != "futures" {
 		log.Printf("MarketDepthWatcher: ERROR: handleAutoClose for non-futures market %s not implemented", signal.CloseMarket)
 		return
 	}
-
 	log.Printf("MarketDepthWatcher: handleAutoClose called for signal %d, user %d", signal.ID, signal.UserID)
-
 	// Проверка подписки (остаётся)
 	subscribed, err := w.subscriptionService.IsUserSubscribed(context.Background(), signal.UserID)
 	if err != nil {
 		log.Printf("MarketDepthWatcher: ERROR: IsUserSubscribed failed for user %d: %v", signal.UserID, err)
 		return
 	}
-
 	if !subscribed {
 		log.Printf("MarketDepthWatcher: INFO: User %d is not subscribed, skipping auto-close", signal.UserID)
 		return
 	}
-
 	// Создание OrderManager с уже существующими зависимостями
 	manager := NewOrderManager(w.futuresClient, w.positionWatcher)
-
 	// Вызов нового метода CloseFullPosition (без side!)
 	log.Printf("MarketDepthWatcher: Attempting to close position for %s", signal.Symbol)
 	err = manager.CloseFullPosition(signal.Symbol)
@@ -697,20 +694,17 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 	log.Printf("MarketDepthWatcher: operation ended %v", endTime)
 	timeNow := time.Now()
 	log.Printf("timeNow: %v", timeNow)
-
 	log.Printf("MarketDepthWatcher: SUCCESS: FULL Position closed for user %d on %s", signal.UserID, signal.CloseMarket)
-	// 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Останавливаем userDataStream после успешного закрытия позиции
-	if w.userDataStream != nil {
-		log.Printf("MarketDepthWatcher: Stopping UserDataStream after signal %d completion", signal.ID)
 
-		// Создаем контекст с таймаутом для остановки
-		stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		w.userDataStream.StopWithContext(stopCtx)
-		w.userDataStream = nil
-
-		log.Printf("MarketDepthWatcher: UserDataStream stopped successfully for user %d", signal.UserID)
+	// 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Не останавливаем userDataStream здесь!
+	// Вместо этого вызываем проверку на уровне WebSocketManager
+	if w.WebSocketManager != nil {
+		log.Printf("MarketDepthWatcher: Scheduling check for UserDataStream stop for user %d", signal.UserID)
+		go func() {
+			// Небольшая задержка для обеспечения обновления состояния сигналов
+			time.Sleep(500 * time.Millisecond)
+			w.WebSocketManager.CheckAndStopUserDataStream(signal.UserID)
+		}()
 	}
 }
 
