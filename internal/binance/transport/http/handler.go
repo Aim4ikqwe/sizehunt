@@ -182,12 +182,12 @@ func (h *Handler) DeleteKeys(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Handler: ERROR: Failed to encode DeleteKeys response: %v", err)
 	}
 }
-
 func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	defer func() {
 		log.Printf("Handler: CreateSignal completed (total time: %v)", time.Since(startTime))
 	}()
+
 	// Восстанавливаем панику для предотвращения падения сервера
 	defer func() {
 		if r := recover(); r != nil {
@@ -195,40 +195,48 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 		}
 	}()
+
 	userID := r.Context().Value(middleware.UserIDKey).(int64)
+
+	// 1. Валидация входных данных (быстрые операции)
 	var req dto.CreateSignalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.Printf("Handler: ERROR: Invalid JSON in CreateSignal request: %v", err)
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
+
 	if err := dto.Validate.Struct(req); err != nil {
 		log.Printf("Handler: ERROR: Validation failed in CreateSignal: %v", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
 	log.Printf("Handler: CreateSignal called for user %d, symbol %s, price %.8f, market %s, autoClose %v",
 		userID, req.Symbol, req.TargetPrice, req.Market, req.AutoClose)
-	// Проверяем подписку
+
+	// 2. Проверка подписки (быстрая операция с БД)
 	subscribed, err := h.SubscriptionService.IsUserSubscribed(r.Context(), userID)
 	if err != nil {
 		log.Printf("Handler: ERROR: IsUserSubscribed failed for user %d: %v", userID, err)
 		http.Error(w, "failed to check subscription", http.StatusInternalServerError)
 		return
 	}
+
 	if !subscribed {
 		log.Printf("Handler: User %d is not subscribed, blocking CreateSignal", userID)
 		http.Error(w, "subscription required", http.StatusForbidden)
 		return
 	}
-	// Получаем API-ключи пользователя
+
+	// 3. Получение и расшифровка ключей (относительно быстрые операции)
 	keys, err := h.KeysRepo.GetKeys(userID)
 	if err != nil {
 		log.Printf("Handler: ERROR: GetKeys failed for user %d: %v", userID, err)
 		http.Error(w, "API keys not found", http.StatusUnauthorized)
 		return
 	}
-	// Расшифровываем ключи
+
 	secret := h.Config.EncryptionSecret
 	apiKey, err := service.DecryptAES(keys.APIKey, secret)
 	if err != nil {
@@ -236,114 +244,83 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to decrypt API key", http.StatusInternalServerError)
 		return
 	}
+
 	secretKey, err := service.DecryptAES(keys.SecretKey, secret)
 	if err != nil {
 		log.Printf("Handler: ERROR: DecryptAES failed for Secret key for user %d: %v", userID, err)
 		http.Error(w, "failed to decrypt Secret key", http.StatusInternalServerError)
 		return
 	}
-	// 🔥 Проверка: если AutoClose включён — убедимся, что позиция НЕ нулевая
+
+	// 4. Проверка позиции для auto-close (если требуется)
+	var positionCheckDuration time.Duration
 	if req.AutoClose {
 		if req.Market != "futures" {
 			log.Printf("Handler: ERROR: AutoClose requested for non-futures market %s", req.Market)
 			http.Error(w, "AutoClose is only supported for futures market", http.StatusBadRequest)
 			return
 		}
+
 		log.Printf("Handler: AutoClose enabled, checking position for %s", req.Symbol)
 		tempFuturesClient := futures.NewClient(apiKey, secretKey)
 		posStartTime := time.Now()
 		resp, err := tempFuturesClient.NewGetPositionRiskService().Symbol(req.Symbol).Do(r.Context())
-		posDuration := time.Since(posStartTime)
+		positionCheckDuration = time.Since(posStartTime)
+
 		if err != nil {
-			log.Printf("Handler: ERROR: Failed to check position for auto-close: %v (took %v)", err, posDuration)
+			log.Printf("Handler: ERROR: Failed to check position for auto-close: %v (took %v)", err, positionCheckDuration)
 			http.Error(w, "failed to verify position", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("Handler: Position check completed (took %v)", posDuration)
+
 		if len(resp) == 0 {
 			log.Printf("Handler: ERROR: No position data returned for symbol %s", req.Symbol)
 			http.Error(w, "no position data available", http.StatusBadRequest)
 			return
 		}
+
 		positionAmt := resp[0].PositionAmt
 		log.Printf("Handler: Current position for %s: %s", req.Symbol, positionAmt)
+
 		if positionAmt == "0" || positionAmt == "0.00000000" || positionAmt == "0.0" {
 			log.Printf("Handler: ERROR: Cannot create auto-close signal: position is zero for %s", req.Symbol)
 			http.Error(w, "cannot create auto-close signal: position is zero", http.StatusBadRequest)
 			return
 		}
-		log.Printf("Handler: Position for %s is %s, allowing auto-close signal", req.Symbol, positionAmt)
+
+		log.Printf("Handler: Position for %s is %s, allowing auto-close signal (check took %v)",
+			req.Symbol, positionAmt, positionCheckDuration)
 	}
-	// Создаём HTTP-клиент для получения начального состояния
+
+	// 5. Получение ордербука (сетевая операция, но необходима)
 	client := service.NewBinanceHTTPClient(apiKey, secretKey)
 	const initialBookLimit = 1000
 	bookStartTime := time.Now()
 	ob, err := client.GetOrderBook(req.Symbol, initialBookLimit, req.Market)
 	bookDuration := time.Since(bookStartTime)
+
 	if err != nil {
 		log.Printf("Handler: ERROR: GetOrderBook failed for symbol %s, market %s: %v (took %v)",
 			req.Symbol, req.Market, err, bookDuration)
 		http.Error(w, fmt.Sprintf("failed to fetch initial order book: %v", err), http.StatusInternalServerError)
 		return
 	}
+
 	log.Printf("Handler: Orderbook fetched successfully (took %v), contains %d bids and %d asks",
 		bookDuration, len(ob.Bids), len(ob.Asks))
-	var initialQty float64 = 0
-	var initialSide string = "UNKNOWN"
-	// Ищем заявку на нужной цене в bids
-	for _, bid := range ob.Bids {
-		if bid.Price == req.TargetPrice {
-			initialQty = bid.Quantity
-			initialSide = bid.Side
-			log.Printf("Handler: Found initial bid at %.8f with quantity %.4f", req.TargetPrice, initialQty)
-			break
-		}
-	}
-	// Если не нашли в bids, ищем в asks
-	if initialQty == 0 {
-		for _, ask := range ob.Asks {
-			if ask.Price == req.TargetPrice {
-				initialQty = ask.Quantity
-				initialSide = ask.Side
-				log.Printf("Handler: Found initial ask at %.8f with quantity %.4f", req.TargetPrice, initialQty)
-				break
-			}
-		}
-	}
+
+	// 6. Поиск заявки на целевой цене
+	initialQty, initialSide := h.findOrderAtPrice(ob, req.TargetPrice, req.MinQuantity)
 	if initialQty == 0 {
 		log.Printf("Handler: ERROR: No order found at price %.8f", req.TargetPrice)
-		// Для отладки выводим ближайшие цены
-		if len(ob.Bids) > 0 {
-			log.Printf("Handler: Closest bid price: %.8f", ob.Bids[0].Price)
-		}
-		if len(ob.Asks) > 0 {
-			log.Printf("Handler: Closest ask price: %.8f", ob.Asks[0].Price)
-		}
 		http.Error(w, fmt.Sprintf("no order found at price %.8f", req.TargetPrice), http.StatusBadRequest)
 		return
 	}
-	if initialQty < req.MinQuantity {
-		log.Printf("Handler: ERROR: Initial quantity %.4f at price %.8f is less than min quantity %.4f",
-			initialQty, req.TargetPrice, req.MinQuantity)
-		http.Error(w, fmt.Sprintf("initial quantity %.4f at price %.8f is less than min quantity %.4f",
-			initialQty, req.TargetPrice, req.MinQuantity), http.StatusBadRequest)
-		return
-	}
+
 	log.Printf("Handler: Found order at target price: %.8f, quantity: %.4f, side: %s",
 		req.TargetPrice, initialQty, initialSide)
-	// 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: используем мультиюзерный метод
-	log.Printf("Handler: Getting or creating watcher for user %d, symbol %s, market %s, autoClose %v",
-		userID, req.Symbol, req.Market, req.AutoClose)
-	watcherStartTime := time.Now()
-	watcher, err := h.WebSocketManager.GetOrCreateWatcherForUser(userID, req.Symbol, req.Market, req.AutoClose)
-	watcherDuration := time.Since(watcherStartTime)
-	if err != nil {
-		log.Printf("Handler: ERROR: Failed to get watcher for user %d, symbol %s: %v (took %v)",
-			userID, req.Symbol, err, watcherDuration)
-		http.Error(w, "failed to create watcher", http.StatusInternalServerError)
-		return
-	}
-	log.Printf("Handler: Watcher obtained successfully (took %v)", watcherDuration)
+
+	// 7. Создание структуры сигнала для БД
 	signalDB := &repository.SignalDB{
 		UserID:          userID,
 		Symbol:          req.Symbol,
@@ -359,13 +336,42 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		WatchMarket:     req.Market,
 		OriginalSide:    initialSide,
 		CreatedAt:       time.Now(),
+		IsActive:        true,
 	}
-	// Сохраняем сигнал в БД
+
+	// 8. Сохранение в БД (блокирующая операция, но необходима перед ответом)
+	saveStartTime := time.Now()
 	if err := h.SignalRepository.Save(r.Context(), signalDB); err != nil {
-		log.Printf("Handler: ERROR: Failed to save signal to database: %v", err)
+		log.Printf("Handler: ERROR: Failed to save signal to database: %v (took %v)", err, time.Since(saveStartTime))
 		http.Error(w, "failed to save signal", http.StatusInternalServerError)
 		return
 	}
+	saveDuration := time.Since(saveStartTime)
+	log.Printf("Handler: Signal saved to database with ID %d (took %v)", signalDB.ID, saveDuration)
+
+	// 9. Получение watcher'а с минимальным временем удержания блокировки
+	log.Printf("Handler: Getting or creating watcher for user %d, symbol %s, market %s, autoClose %v",
+		userID, req.Symbol, req.Market, req.AutoClose)
+
+	watcherStartTime := time.Now()
+	watcher, err := h.WebSocketManager.GetOrCreateWatcherForUser(userID, req.Symbol, req.Market, req.AutoClose)
+	watcherDuration := time.Since(watcherStartTime)
+
+	if err != nil {
+		// При ошибке получения watcher'а - удаляем сигнал из БД
+		if delErr := h.SignalRepository.Delete(r.Context(), signalDB.ID); delErr != nil {
+			log.Printf("Handler: ERROR: Failed to clean up signal %d after watcher error: %v", signalDB.ID, delErr)
+		}
+
+		log.Printf("Handler: ERROR: Failed to get watcher for user %d, symbol %s: %v (took %v)",
+			userID, req.Symbol, err, watcherDuration)
+		http.Error(w, "failed to create watcher", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Handler: Watcher obtained successfully (took %v)", watcherDuration)
+
+	// 10. Создание сигнала для внутренней обработки
 	signal := &service.Signal{
 		ID:              signalDB.ID,
 		UserID:          signalDB.UserID,
@@ -383,12 +389,8 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		OriginalSide:    signalDB.OriginalSide,
 		CreatedAt:       signalDB.CreatedAt,
 	}
-	log.Printf("Handler: Adding signal %d to watcher for user %d, symbol %s, initialQty %.4f, side %s",
-		signal.ID, userID, req.Symbol, initialQty, initialSide)
-	addSignalStartTime := time.Now()
-	watcher.AddSignal(signal)
-	addSignalDuration := time.Since(addSignalStartTime)
-	log.Printf("Handler: Signal %d added successfully (took %v)", signal.ID, addSignalDuration)
+
+	// 11. Формирование ответа до добавления сигнала в watcher
 	response := map[string]interface{}{
 		"message":          "signal created successfully",
 		"signal_id":        signal.ID,
@@ -397,10 +399,60 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		"initial_quantity": initialQty,
 		"side":             initialSide,
 	}
+
+	// 12. Отправка ответа клиенту
 	w.WriteHeader(http.StatusCreated)
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Handler: ERROR: Failed to encode CreateSignal response: %v", err)
 	}
+
+	// 13. Асинхронное добавление сигнала в watcher
+	log.Printf("Handler: Adding signal %d to watcher for user %d, symbol %s, initialQty %.4f, side %s (async)",
+		signal.ID, userID, req.Symbol, initialQty, initialSide)
+
+	go func() {
+		addSignalStartTime := time.Now()
+		watcher.AddSignal(signal)
+		addSignalDuration := time.Since(addSignalStartTime)
+		log.Printf("Handler: Signal %d added to watcher successfully (async, took %v)", signal.ID, addSignalDuration)
+	}()
+}
+
+// findOrderAtPrice ищет заявку на целевой цене в ордербуке
+func (h *Handler) findOrderAtPrice(ob *service.OrderBook, targetPrice, minQuantity float64) (float64, string) {
+	// Ищем в bids
+	for _, bid := range ob.Bids {
+		if bid.Price == targetPrice {
+			if bid.Quantity >= minQuantity {
+				return bid.Quantity, bid.Side
+			}
+			log.Printf("Handler: Found bid at %.8f but quantity %.4f is less than required %.4f",
+				targetPrice, bid.Quantity, minQuantity)
+			return 0, ""
+		}
+	}
+
+	// Если не нашли в bids, ищем в asks
+	for _, ask := range ob.Asks {
+		if ask.Price == targetPrice {
+			if ask.Quantity >= minQuantity {
+				return ask.Quantity, ask.Side
+			}
+			log.Printf("Handler: Found ask at %.8f but quantity %.4f is less than required %.4f",
+				targetPrice, ask.Quantity, minQuantity)
+			return 0, ""
+		}
+	}
+
+	// Для отладки выводим ближайшие цены
+	if len(ob.Bids) > 0 {
+		log.Printf("Handler: Closest bid price: %.8f", ob.Bids[0].Price)
+	}
+	if len(ob.Asks) > 0 {
+		log.Printf("Handler: Closest ask price: %.8f", ob.Asks[0].Price)
+	}
+
+	return 0, ""
 }
 
 func (h *Handler) GetOrderAtPrice(w http.ResponseWriter, r *http.Request) {

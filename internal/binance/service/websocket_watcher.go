@@ -3,7 +3,7 @@ package service
 
 import (
 	"context"
-	"fmt"
+
 	"log"
 	"runtime"
 	"strconv"
@@ -116,32 +116,6 @@ func (w *MarketDepthWatcher) AddSignal(signal *Signal) {
 	defer func() {
 		log.Printf("MarketDepthWatcher: AddSignal completed (total time: %v)", time.Since(startTime))
 	}()
-	// Сначала сохраняем в БД
-	if w.signalRepository != nil {
-		signalDB := &binance_repository.SignalDB{
-			UserID:          signal.UserID,
-			Symbol:          signal.Symbol,
-			TargetPrice:     signal.TargetPrice,
-			MinQuantity:     signal.MinQuantity,
-			TriggerOnCancel: signal.TriggerOnCancel,
-			TriggerOnEat:    signal.TriggerOnEat,
-			EatPercentage:   signal.EatPercentage,
-			OriginalQty:     signal.OriginalQty,
-			LastQty:         signal.LastQty,
-			AutoClose:       signal.AutoClose,
-			CloseMarket:     signal.CloseMarket,
-			WatchMarket:     signal.WatchMarket,
-			OriginalSide:    signal.OriginalSide,
-			CreatedAt:       signal.CreatedAt,
-		}
-
-		if err := w.signalRepository.Save(context.Background(), signalDB); err != nil {
-			log.Printf("MarketDepthWatcher: ERROR: Failed to save signal to database: %v", err)
-		} else {
-			signal.ID = signalDB.ID
-			log.Printf("MarketDepthWatcher: Signal saved to database with ID %d", signal.ID)
-		}
-	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -161,7 +135,6 @@ func (w *MarketDepthWatcher) AddSignal(signal *Signal) {
 	// Добавляем сигнал в список для его символа
 	currentSignals := w.signalsBySymbol[signal.Symbol]
 	w.signalsBySymbol[signal.Symbol] = append(currentSignals, signal)
-
 	log.Printf("MarketDepthWatcher: Signal %d added. Total signals for %s: %d",
 		signal.ID, signal.Symbol, len(w.signalsBySymbol[signal.Symbol]))
 
@@ -207,24 +180,19 @@ func (w *MarketDepthWatcher) AddSignal(signal *Signal) {
 			signal.Symbol, signal.TargetPrice, existingBidQty, existingAskQty)
 	}
 
-	// Если символ был неактивен, возможно, нужно инициировать подключение
+	// Если символ был неактивен и соединение не установлено, запускаем его
 	if !wasActive && !w.started {
-		log.Printf("MarketDepthWatcher: First signal for symbol %s, attempting to start connection.", signal.Symbol)
-		// Вызываем Start *внутри той же блокировки*, чтобы избежать гонки
-		if !w.started {
-			w.started = true
-			go func() {
-				if err := w.startConnection(); err != nil {
-					log.Printf("MarketDepthWatcher: ERROR: Failed to start connection after adding first symbol: %v", err)
-					// Сбрасываем флаг started
-					w.mu.Lock()
-					w.started = false
-					w.mu.Unlock()
-				} else {
-					log.Printf("MarketDepthWatcher: Connection started successfully for symbol %s", signal.Symbol)
-				}
-			}()
-		}
+		log.Printf("MarketDepthWatcher: First signal for symbol %s, connection will be started asynchronously", signal.Symbol)
+		go func() {
+			if err := w.StartConnection(); err != nil {
+				log.Printf("MarketDepthWatcher: ERROR: Failed to start connection after adding first symbol: %v", err)
+				w.mu.Lock()
+				w.started = false
+				w.mu.Unlock()
+			} else {
+				log.Printf("MarketDepthWatcher: Connection started successfully for symbol %s", signal.Symbol)
+			}
+		}()
 	}
 }
 
@@ -233,10 +201,11 @@ func (w *MarketDepthWatcher) RemoveSignal(id int64) {
 	defer func() {
 		log.Printf("MarketDepthWatcher: RemoveSignal completed (total time: %v)", time.Since(startTime))
 	}()
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.lastActivityTime = time.Now()
 
+	w.lastActivityTime = time.Now()
 	w.removeSignalByIDLocked(id)
 }
 func (w *MarketDepthWatcher) removeSignalByIDLocked(id int64) {
@@ -247,7 +216,7 @@ func (w *MarketDepthWatcher) removeSignalByIDLocked(id int64) {
 				w.signalsBySymbol[symbol] = append(signals[:i], signals[i+1:]...)
 				log.Printf("MarketDepthWatcher: Removed signal %d for symbol %s", id, symbol)
 
-				// Если больше нет сигналов для этого символа - очищаем ВСЕ ресурсы
+				// Если больше нет сигналов для этого символа - помечаем символ как неактивный
 				if len(w.signalsBySymbol[symbol]) == 0 {
 					delete(w.signalsBySymbol, symbol)
 					delete(w.activeSymbols, symbol)
@@ -258,8 +227,6 @@ func (w *MarketDepthWatcher) removeSignalByIDLocked(id int64) {
 						log.Printf("MarketDepthWatcher: Orderbook cleaned up for symbol %s", symbol)
 					}
 
-					log.Printf("MarketDepthWatcher: All signals removed for symbol %s, cleaning up resources", symbol)
-
 					// Если это был последний символ - останавливаем WebSocket
 					if len(w.activeSymbols) == 0 {
 						if w.client != nil {
@@ -269,13 +236,29 @@ func (w *MarketDepthWatcher) removeSignalByIDLocked(id int64) {
 						}
 						w.started = false
 						log.Printf("MarketDepthWatcher: WebSocket connection closed and marked as not started")
-					} else {
-						log.Printf("MarketDepthWatcher: Still %d active symbols remaining", len(w.activeSymbols))
 					}
-				} else {
-					log.Printf("MarketDepthWatcher: Still %d signals remaining for symbol %s",
-						len(w.signalsBySymbol[symbol]), symbol)
 				}
+
+				// Обновляем сигнал в БД асинхронно
+				go func() {
+					if w.signalRepository != nil {
+						ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+						defer cancel()
+
+						signalDB := &binance_repository.SignalDB{
+							ID:       id,
+							IsActive: false,
+							LastQty:  signal.LastQty,
+						}
+
+						if err := w.signalRepository.Update(ctx, signalDB); err != nil {
+							log.Printf("MarketDepthWatcher: WARNING: Failed to update signal %d in database: %v", id, err)
+						} else {
+							log.Printf("MarketDepthWatcher: Signal %d deactivated in database", id)
+						}
+					}
+				}()
+
 				return
 			}
 		}
@@ -284,40 +267,52 @@ func (w *MarketDepthWatcher) removeSignalByIDLocked(id int64) {
 }
 
 // startConnection вызывается только один раз при добавлении первого символа
-func (w *MarketDepthWatcher) startConnection() error {
+
+func (w *MarketDepthWatcher) StartConnection() error {
 	startTime := time.Now()
 	defer func() {
-		log.Printf("MarketDepthWatcher: startConnection completed (total time: %v)", time.Since(startTime))
+		log.Printf("MarketDepthWatcher: StartConnection completed (total time: %v)", time.Since(startTime))
 	}()
+
+	// Проверяем, не запущен ли уже watcher
+	w.mu.RLock()
+	if w.started {
+		w.mu.RUnlock()
+		log.Printf("MarketDepthWatcher: Connection already started for market %s", w.market)
+		return nil
+	}
+	w.mu.RUnlock()
+
+	// Блокируем только для установки флага started
+	w.mu.Lock()
+	if w.started {
+		w.mu.Unlock()
+		return nil
+	}
+	w.started = true
+	w.mu.Unlock()
 
 	log.Printf("MarketDepthWatcher: Starting connection for market %s", w.market)
 
 	client := NewWebSocketClient()
 	client.OnData = func(data *UnifiedDepthStreamData) {
 		w.lastActivityTime = time.Now()
-
-		// Только для отладки - можно закомментировать в продакшене
-		if len(data.Data.Bids) > 0 && len(data.Data.Asks) > 0 {
-			bidPrice, _ := strconv.ParseFloat(data.Data.Bids[0][0], 64)
-			bidQty, _ := strconv.ParseFloat(data.Data.Bids[0][1], 64)
-			askPrice, _ := strconv.ParseFloat(data.Data.Asks[0][0], 64)
-			askQty, _ := strconv.ParseFloat(data.Data.Asks[0][1], 64)
-			log.Printf("MarketDepthWatcher: Received data for %s (%s), first bid: %.8f (%.4f), first ask: %.8f (%.4f)",
-				data.Data.Symbol, w.market, bidPrice, bidQty, askPrice, askQty)
-		}
-
-		w.processDepthUpdate(data)
+		w.processDepthUpdateAsync(data)
 	}
 
-	// Подписываемся на все активные символы
+	// Получаем список активных символов без блокировки
+	w.mu.RLock()
 	symbols := make([]string, 0, len(w.activeSymbols))
 	for symbol := range w.activeSymbols {
 		symbols = append(symbols, symbol)
-		log.Printf("MarketDepthWatcher: Subscribing to symbol %s", symbol)
 	}
+	w.mu.RUnlock()
 
 	if len(symbols) == 0 {
 		log.Printf("MarketDepthWatcher: WARNING: No symbols to watch for market %s, skipping connection.", w.market)
+		w.mu.Lock()
+		w.started = false
+		w.mu.Unlock()
 		return nil
 	}
 
@@ -326,31 +321,28 @@ func (w *MarketDepthWatcher) startConnection() error {
 	case "spot":
 		log.Printf("MarketDepthWatcher: Connecting to spot combined WebSocket for %d symbols", len(symbols))
 		err = client.ConnectForSpotCombined(w.ctx, symbols)
+
 	case "futures":
-		// Для futures WsCombinedDepthServe принимает map[string]string
 		symbolLevels := make(map[string]string)
-		for symbol := range w.activeSymbols {
+		for _, symbol := range symbols {
 			symbolLevels[symbol] = "" // "" означает дифф-поток без фиксированного уровня
 		}
-
 		log.Printf("MarketDepthWatcher: Connecting to futures combined WebSocket for %d symbols", len(symbolLevels))
 		err = client.ConnectForFuturesCombined(w.ctx, symbolLevels)
-		if err != nil {
-			log.Printf("MarketDepthWatcher: ERROR: Failed to connect to futures combined WebSocket: %v", err)
-			return fmt.Errorf("failed to connect to futures combined WebSocket: %w", err)
-		}
 	}
 
 	if err != nil {
 		log.Printf("MarketDepthWatcher: ERROR: Failed to connect to combined WebSocket for %s: %v", w.market, err)
-		// Сбросим флаг started, если не удалось подключиться
 		w.mu.Lock()
 		w.started = false
 		w.mu.Unlock()
 		return err
 	}
 
+	w.mu.Lock()
 	w.client = client
+	w.mu.Unlock()
+
 	log.Printf("MarketDepthWatcher: Successfully connected to combined WebSocket for market: %s (took %v)",
 		w.market, time.Since(startTime))
 
@@ -397,7 +389,7 @@ func (w *MarketDepthWatcher) monitorActivity() {
 
 					// Перезапускаем соединение
 					go func() {
-						if err := w.startConnection(); err != nil {
+						if err := w.StartConnection(); err != nil {
 							log.Printf("MarketDepthWatcher: ERROR: Reconnection failed: %v", err)
 						} else {
 							log.Printf("MarketDepthWatcher: Successfully reconnected after inactivity")
@@ -422,18 +414,35 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	}()
 
 	symbol := data.Data.Symbol
-	w.mu.Lock()
-	defer w.mu.Unlock()
 
-	w.lastActivityTime = time.Now()
+	w.mu.RLock()
+	// Проверяем, активен ли символ и есть ли сигналы
+	_, _ = w.orderBooks[symbol]
+	signalsCount := len(w.signalsBySymbol[symbol])
+	active := w.activeSymbols[symbol]
+	w.mu.RUnlock()
 
-	// --- ИЗМЕРЕНИЕ ЗАДЕРЖКИ СЕТЕВОГО СОБЫТИЯ ---
+	// Если символ не активен или нет сигналов, пропускаем обработку
+	if !active || signalsCount == 0 {
+		log.Printf("MarketDepthWatcher: Skipping update for %s - no active signals", symbol)
+		return
+	}
+
+	// Обрабатываем данные
 	binanceEventTime := time.UnixMilli(data.Data.EventTime)
 	receivedTime := time.Now()
 	networkLatency := receivedTime.Sub(binanceEventTime)
 
 	log.Printf("MarketDepthWatcher: Processing depth update for %s (%s), EventTime: %v, Received: %v, Latency: %v",
 		symbol, w.market, binanceEventTime, receivedTime, networkLatency)
+
+	// Обрабатываем сигналы для символа
+	var signalsToRemove []int64
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.lastActivityTime = time.Now()
 
 	// Получаем или создаём локальный стакан для символа
 	ob, ok := w.orderBooks[symbol]
@@ -447,21 +456,13 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		log.Printf("MarketDepthWatcher: Created new orderbook for symbol %s during update processing", symbol)
 	}
 
-	// Применяем обновления к локальному стакану
-	log.Printf("MarketDepthWatcher: Processing %d bid updates and %d ask updates for %s",
-		len(data.Data.Bids), len(data.Data.Asks), symbol)
-
 	// Обновляем bids
 	for _, bidUpdate := range data.Data.Bids {
 		price, _ := strconv.ParseFloat(bidUpdate[0], 64)
 		qty, _ := strconv.ParseFloat(bidUpdate[1], 64)
-
 		if qty == 0 {
-			if _, exists := ob.Bids[price]; exists {
-				delete(ob.Bids, price)
-			}
+			delete(ob.Bids, price)
 		} else {
-			_ = ob.Bids[price]
 			ob.Bids[price] = qty
 		}
 	}
@@ -470,13 +471,9 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	for _, askUpdate := range data.Data.Asks {
 		price, _ := strconv.ParseFloat(askUpdate[0], 64)
 		qty, _ := strconv.ParseFloat(askUpdate[1], 64)
-
 		if qty == 0 {
-			if _, exists := ob.Asks[price]; exists {
-				delete(ob.Asks, price)
-			}
+			delete(ob.Asks, price)
 		} else {
-			_ = ob.Asks[price]
 			ob.Asks[price] = qty
 		}
 	}
@@ -496,12 +493,8 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 
 	log.Printf("MarketDepthWatcher: Found %d signals to process for symbol %s", len(signalsForSymbol), symbol)
 
-	// Собираем ID сигналов, которые нужно удалить
-	signalsToRemove := []int64{}
-
 	for _, signal := range signalsForSymbol {
 		found, currentQty := w.findOrderAtPrice(ob, signal.TargetPrice)
-
 		log.Printf("MarketDepthWatcher: Processing signal %d for price %.8f: found=%v, currentQty=%.4f, originalQty=%.4f",
 			signal.ID, signal.TargetPrice, found, currentQty, signal.OriginalQty)
 
@@ -511,28 +504,21 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 				triggerTime := time.Now()
 				signal.TriggerTime = triggerTime
 				signal.BinanceEventTime = binanceEventTime
-
 				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel at %v",
 					signal.ID, signal.TargetPrice, signal.LastQty, triggerTime)
-
 				order := &entity.Order{
 					Price:    signal.TargetPrice,
 					Quantity: signal.LastQty,
 					Side:     signal.OriginalSide,
 				}
-
 				if w.onTrigger != nil {
 					log.Printf("MarketDepthWatcher: Calling onTrigger callback for signal %d", signal.ID)
 					w.onTrigger(signal, order)
 				}
-
-				// 🔥 ВАЖНО: Сначала собираем ID для удаления
 				signalsToRemove = append(signalsToRemove, signal.ID)
 
-				// 🔥 ЗАТЕМ запускаем асинхронное закрытие позиции
 				if signal.AutoClose {
 					log.Printf("MarketDepthWatcher: Signal %d: Scheduling handleAutoClose for cancel (async, after signal removal)", signal.ID)
-					// Создаем копии данных для горутины
 					sigCopy := *signal
 					orderCopy := *order
 					go func() {
@@ -550,36 +536,27 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 			if signal.OriginalQty > 0 {
 				eatenPercentage = eaten / signal.OriginalQty
 			}
-
 			log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), threshold: %.2f%%",
 				signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty, signal.EatPercentage*100)
-
 			if eatenPercentage >= signal.EatPercentage {
 				triggerTime := time.Now()
 				signal.TriggerTime = triggerTime
 				signal.BinanceEventTime = binanceEventTime
-
 				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat at %v",
 					signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty, triggerTime)
-
 				order := &entity.Order{
 					Price:    signal.TargetPrice,
 					Quantity: currentQty,
 					Side:     signal.OriginalSide,
 				}
-
 				if w.onTrigger != nil {
 					log.Printf("MarketDepthWatcher: Calling onTrigger callback for signal %d", signal.ID)
 					w.onTrigger(signal, order)
 				}
-
-				// 🔥 ВАЖНО: Сначала собираем ID для удаления
 				signalsToRemove = append(signalsToRemove, signal.ID)
 
-				// 🔥 ЗАТЕМ запускаем асинхронное закрытие позиции
 				if signal.AutoClose {
 					log.Printf("MarketDepthWatcher: Signal %d: Scheduling handleAutoClose for eat (async, after signal removal)", signal.ID)
-					// Создаем копии данных для горутины
 					sigCopy := *signal
 					orderCopy := *order
 					go func() {
@@ -607,10 +584,10 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		}
 	}
 
-	// 🔥 КРИТИЧЕСКИ ВАЖНО: Удаляем все сработавшие сигналы ДО выхода из блокировки
+	// Удаляем все сработавшие сигналы
 	for _, id := range signalsToRemove {
 		log.Printf("MarketDepthWatcher: Removing triggered signal %d immediately after trigger", id)
-		w.removeSignalByID(id)
+		w.removeSignalByIDLocked(id)
 	}
 
 	log.Printf("MarketDepthWatcher: Depth update processing completed for %s. Removed %d signals.",
@@ -784,19 +761,20 @@ func (w *MarketDepthWatcher) GetOrderBook(symbol string) *OrderBookMap {
 }
 
 // internal/binance/service/websocket_watcher.go
+
 func (w *MarketDepthWatcher) RemoveAllSignalsForSymbol(symbol string) {
 	startTime := time.Now()
 	defer func() {
 		log.Printf("MarketDepthWatcher: RemoveAllSignalsForSymbol for %s completed (total time: %v)",
 			symbol, time.Since(startTime))
 	}()
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if signals, exists := w.signalsBySymbol[symbol]; exists {
 		log.Printf("MarketDepthWatcher: Removing %d signals for symbol %s", len(signals), symbol)
 		for _, sig := range signals {
-			// Используем существующую логику удаления для каждого сигнала
 			w.removeSignalByIDLocked(sig.ID)
 		}
 	} else {
@@ -853,4 +831,74 @@ func (w *MarketDepthWatcher) GetAllSignalsForSymbol(symbol string) []*Signal {
 	result := make([]*Signal, len(signals))
 	copy(result, signals)
 	return result
+}
+func (w *MarketDepthWatcher) HasSignal(signalID int64) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	for _, signals := range w.signalsBySymbol {
+		for _, s := range signals {
+			if s.ID == signalID {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+func (w *MarketDepthWatcher) GetAllSignals() []*Signal {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	var allSignals []*Signal
+	for _, signals := range w.signalsBySymbol {
+		allSignals = append(allSignals, signals...)
+	}
+
+	return allSignals
+}
+func (w *MarketDepthWatcher) AddSignalAsync(signal *Signal) {
+	// Сохраняем сигнал в БД в отдельной горутине
+	if w.signalRepository != nil {
+		go func() {
+			signalDB := &binance_repository.SignalDB{
+				UserID:          signal.UserID,
+				Symbol:          signal.Symbol,
+				TargetPrice:     signal.TargetPrice,
+				MinQuantity:     signal.MinQuantity,
+				TriggerOnCancel: signal.TriggerOnCancel,
+				TriggerOnEat:    signal.TriggerOnEat,
+				EatPercentage:   signal.EatPercentage,
+				OriginalQty:     signal.OriginalQty,
+				LastQty:         signal.LastQty,
+				AutoClose:       signal.AutoClose,
+				CloseMarket:     signal.CloseMarket,
+				WatchMarket:     signal.WatchMarket,
+				OriginalSide:    signal.OriginalSide,
+				CreatedAt:       signal.CreatedAt,
+			}
+
+			startTime := time.Now()
+			if err := w.signalRepository.Save(context.Background(), signalDB); err != nil {
+				log.Printf("MarketDepthWatcher: ERROR: Failed to save signal to database: %v", err)
+			} else {
+				signal.ID = signalDB.ID
+				log.Printf("MarketDepthWatcher: Signal saved to database with ID %d (took %v)", signal.ID, time.Since(startTime))
+			}
+		}()
+	}
+
+	// Добавляем сигнал в структуры данных
+	w.AddSignal(signal)
+}
+func (w *MarketDepthWatcher) processDepthUpdateAsync(data *UnifiedDepthStreamData) {
+	go func() {
+		startTime := time.Now()
+		defer func() {
+			log.Printf("MarketDepthWatcher: processDepthUpdateAsync for %s completed (total time: %v)",
+				data.Data.Symbol, time.Since(startTime))
+		}()
+
+		w.processDepthUpdate(data)
+	}()
 }
