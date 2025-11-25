@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"sizehunt/internal/binance/repository"
 	"sizehunt/internal/config"
 	subscriptionservice "sizehunt/internal/subscription/service"
@@ -31,13 +32,16 @@ type UserWatcher struct {
 }
 
 type WebSocketManager struct {
-	mu           sync.RWMutex
-	userWatchers map[int64]*UserWatcher // userID → UserWatcher
-	subService   *subscriptionservice.Service
-	keysRepo     *repository.PostgresKeysRepo
-	signalRepo   repository.SignalRepository
-	cfg          *config.Config
-	ctx          context.Context
+	mu                sync.RWMutex
+	userWatchers      map[int64]*UserWatcher // userID → UserWatcher
+	subService        *subscriptionservice.Service
+	keysRepo          *repository.PostgresKeysRepo
+	signalRepo        repository.SignalRepository
+	cfg               *config.Config
+	ctx               context.Context
+	networkStatus     string // "up" или "down"
+	lastNetworkChange time.Time
+	networkMu         sync.Mutex
 }
 
 func NewWebSocketManager(
@@ -60,7 +64,6 @@ func NewWebSocketManager(
 }
 
 // Загружаем все активные сигналы из БД при старте
-// Загружаем все активные сигналы из БД при старте
 func (m *WebSocketManager) LoadActiveSignals() error {
 	log.Println("WebSocketManager: Loading active signals from database")
 
@@ -69,6 +72,12 @@ func (m *WebSocketManager) LoadActiveSignals() error {
 	if err != nil {
 		return fmt.Errorf("failed to get all active signals: %w", err)
 	}
+	inactiveAutoCloseSignals, err := m.signalRepo.GetInactiveAutoCloseSignals(context.Background())
+	if err != nil {
+		log.Printf("WebSocketManager: WARNING: Failed to get inactive auto-close signals: %v", err)
+	}
+	_ = append(signals, inactiveAutoCloseSignals...)
+	log.Printf("WebSocketManager: Found %d active signals and %d inactive auto-close signals in database", len(signals), len(inactiveAutoCloseSignals))
 
 	log.Printf("WebSocketManager: Found %d active signals in database", len(signals))
 
@@ -642,4 +651,268 @@ func (m *WebSocketManager) CheckAndStopUserDataStream(userID int64) {
 	} else {
 		log.Printf("WebSocketManager: No UserDataStream to stop for user %d", userID)
 	}
+}
+func (m *WebSocketManager) StartConnectionMonitor() {
+	log.Println("WebSocketManager: Starting connection monitor")
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	client := http.Client{
+		Timeout: 2 * time.Second,
+	}
+
+	// Инициализируем статус сети
+	m.networkStatus = "up"
+	m.lastNetworkChange = time.Now()
+
+	for {
+		select {
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			req, _ := http.NewRequestWithContext(ctx, "GET", "https://api.binance.com/api/v3/ping", nil)
+			resp, err := client.Do(req)
+
+			networkUp := (err == nil && resp != nil && resp.StatusCode == http.StatusOK)
+			if resp != nil {
+				resp.Body.Close()
+			}
+
+			m.networkMu.Lock()
+			prevStatus := m.networkStatus
+			if networkUp {
+				m.networkStatus = "up"
+				if prevStatus == "down" {
+					m.lastNetworkChange = time.Now()
+					log.Printf("WebSocketManager: Network restored at %v", m.lastNetworkChange)
+					// Запускаем восстановление auto-close в отдельной горутине
+					go m.restoreAutoCloseFeatures()
+				}
+			} else {
+				m.networkStatus = "down"
+				if prevStatus == "up" {
+					m.lastNetworkChange = time.Now()
+					log.Printf("WebSocketManager: Network lost at %v", m.lastNetworkChange)
+					m.handleNetworkDown()
+				}
+			}
+			m.networkMu.Unlock()
+
+		case <-m.ctx.Done():
+			log.Println("WebSocketManager: Connection monitor stopped")
+			return
+		}
+	}
+}
+
+func (m *WebSocketManager) checkCircuitBreakers() {
+	// Здесь можно добавить логику для проверки состояния circuit breakers
+	// Например, отправка метрик в мониторинг
+}
+
+func (m *WebSocketManager) handleNetworkDown() {
+	log.Printf("WebSocketManager: Network down, temporarily disabling auto-close features")
+
+	userIDs := m.GetAllUserIDs()
+
+	for _, userID := range userIDs {
+		signals := m.GetUserSignals(userID)
+
+		for _, signal := range signals {
+			if signal.AutoClose {
+				log.Printf("WebSocketManager: Temporarily deactivating auto-close for signal %d (user %d, symbol %s) due to network issues",
+					signal.ID, userID, signal.Symbol)
+
+				// Обновляем статус в БД, но сохраняем флаг auto_close = true для последующего восстановления
+				signalDB := &repository.SignalDB{
+					ID:        signal.ID,
+					IsActive:  false, // Временно деактивируем
+					LastQty:   signal.LastQty,
+					AutoClose: true, // Сохраняем флаг для восстановления
+				}
+
+				if err := m.signalRepo.Update(context.Background(), signalDB); err != nil {
+					log.Printf("WebSocketManager: ERROR: Failed to update signal %d during network down: %v", signal.ID, err)
+				}
+			}
+		}
+	}
+
+	// Не удаляем полностью сигналы, а только деактивируем их для восстановления позже
+	log.Printf("WebSocketManager: All auto-close features temporarily disabled due to network issues")
+}
+func (m *WebSocketManager) disableAutoCloseForUser(userID int64) {
+	log.Printf("WebSocketManager: Disabling auto-close for user %d due to network issues", userID)
+
+	m.mu.RLock()
+	uw, exists := m.userWatchers[userID]
+	m.mu.RUnlock()
+
+	if !exists || uw == nil {
+		return
+	}
+
+	uw.mu.Lock()
+	defer uw.mu.Unlock()
+
+	var affectedSignals []int64
+
+	// Отключаем auto-close для всех фьючерсных сигналов
+	for symbol, watcher := range uw.futuresWatchers {
+		signals := watcher.GetAllSignals()
+		for _, signal := range signals {
+			if signal.AutoClose {
+				signal.AutoClose = false
+				affectedSignals = append(affectedSignals, signal.ID)
+				log.Printf("WebSocketManager: Auto-close disabled for signal %d (user %d, symbol %s) due to network issues",
+					signal.ID, userID, symbol)
+			}
+		}
+	}
+
+	if len(affectedSignals) > 0 {
+		// Обновляем сигналы в БД
+		go func() {
+			for _, signalID := range affectedSignals {
+				if err := m.signalRepo.Update(context.Background(), &repository.SignalDB{
+					ID:        signalID,
+					AutoClose: false,
+				}); err != nil {
+					log.Printf("WebSocketManager: ERROR: Failed to update signal %d in database: %v", signalID, err)
+				}
+			}
+			// Отправляем уведомление пользователю
+			go m.notifyUserAboutNetworkIssue(userID)
+		}()
+	}
+}
+func (m *WebSocketManager) notifyUserAboutNetworkIssue(userID int64) {
+	// Здесь можно реализовать отправку уведомления пользователю
+	// Например, через email, push-уведомление или сохранение в БД
+	log.Printf("NOTIFICATION: User %d - Auto-close features disabled due to network connection issues. Please manage your positions manually.", userID)
+
+	// Пример сохранения в БД для отображения в интерфейсе:
+	// notification := &Notification{
+	//     UserID:  userID,
+	//     Message: "Auto-close features disabled due to network connection issues. Please manage your positions manually.",
+	//     Type:    "network_issue",
+	// }
+	// m.notificationRepo.Save(notification)
+}
+func (m *WebSocketManager) restoreAutoCloseFeatures() {
+	log.Println("WebSocketManager: Restoring auto-close features for all users")
+
+	// Получаем всех пользователей с активными сигналами
+	userIDs := m.GetAllUserIDs()
+
+	for _, userID := range userIDs {
+		log.Printf("WebSocketManager: Checking signals for user %d", userID)
+		signals := m.GetUserSignals(userID)
+
+		for _, signal := range signals {
+			// Проверяем, был ли сигнал с auto-close отключен из-за потери сети
+			if signal.AutoClose {
+				log.Printf("WebSocketManager: Restoring auto-close for signal %d (user %d, symbol %s)",
+					signal.ID, userID, signal.Symbol)
+
+				// Загружаем актуальные данные из БД
+				signalDB, err := m.signalRepo.GetByID(context.Background(), signal.ID)
+				if err != nil {
+					log.Printf("WebSocketManager: ERROR: Failed to get signal %d from DB: %v", signal.ID, err)
+					continue
+				}
+
+				// Если сигнал был деактивирован из-за сети, проверяем позицию и восстанавливаем
+				if !signalDB.IsActive {
+					// Проверяем текущую позицию на Binance
+					posAmt, err := m.checkPositionForSignal(signalDB)
+					if err != nil {
+						log.Printf("WebSocketManager: WARNING: Failed to check position for signal %d: %v", signalDB.ID, err)
+						continue
+					}
+
+					// Если позиция не нулевая, восстанавливаем сигнал
+					if posAmt != 0 {
+						log.Printf("WebSocketManager: Position for %s is %.6f, reactivating auto-close signal", signalDB.Symbol, posAmt)
+						signalDB.IsActive = true
+						signalDB.LastQty = posAmt // Обновляем последний объем
+
+						// Обновляем в БД
+						if err := m.signalRepo.Update(context.Background(), signalDB); err != nil {
+							log.Printf("WebSocketManager: ERROR: Failed to update signal %d: %v", signalDB.ID, err)
+							continue
+						}
+
+						// Восстанавливаем watcher для этого сигнала
+						go func() {
+							watcher, err := m.createWatcherForUser(userID, signalDB.Symbol, signalDB.WatchMarket, true)
+							if err != nil {
+								log.Printf("WebSocketManager: ERROR: Failed to recreate watcher for signal %d: %v", signalDB.ID, err)
+								return
+							}
+
+							// Создаем новый сигнал с актуальными данными
+							restoredSignal := &Signal{
+								ID:              signalDB.ID,
+								UserID:          signalDB.UserID,
+								Symbol:          signalDB.Symbol,
+								TargetPrice:     signalDB.TargetPrice,
+								MinQuantity:     signalDB.MinQuantity,
+								TriggerOnCancel: signalDB.TriggerOnCancel,
+								TriggerOnEat:    signalDB.TriggerOnEat,
+								EatPercentage:   signalDB.EatPercentage,
+								OriginalQty:     posAmt, // Используем текущий объем как начальный
+								LastQty:         posAmt,
+								AutoClose:       true,
+								CloseMarket:     signalDB.CloseMarket,
+								WatchMarket:     signalDB.WatchMarket,
+								OriginalSide:    signalDB.OriginalSide,
+								CreatedAt:       signalDB.CreatedAt,
+							}
+
+							watcher.AddSignal(restoredSignal)
+							log.Printf("WebSocketManager: Successfully restored auto-close for signal %d", signalDB.ID)
+
+							// Отправляем уведомление пользователю
+							m.notifyUserAboutRestoredFeature(userID, signalDB.Symbol)
+						}()
+					} else {
+						log.Printf("WebSocketManager: Position for %s is zero, not restoring signal %d", signalDB.Symbol, signalDB.ID)
+					}
+				}
+			}
+		}
+	}
+	log.Println("WebSocketManager: Auto-close restoration process completed")
+}
+func (m *WebSocketManager) checkPositionForSignal(signalDB *repository.SignalDB) (float64, error) {
+	// Получаем API ключи пользователя
+	okKeys, apiKey, secretKey := m.getKeysForUser(signalDB.UserID)
+	if !okKeys {
+		return 0, fmt.Errorf("no valid API keys for user %d", signalDB.UserID)
+	}
+
+	// Создаем временный клиент для проверки позиции
+	client := futures.NewClient(apiKey, secretKey)
+	resp, err := client.NewGetPositionRiskService().Symbol(signalDB.Symbol).Do(context.Background())
+	if err != nil {
+		return 0, err
+	}
+
+	if len(resp) == 0 {
+		return 0, nil
+	}
+
+	positionAmt, err := strconv.ParseFloat(resp[0].PositionAmt, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return positionAmt, nil
+}
+
+func (m *WebSocketManager) notifyUserAboutRestoredFeature(userID int64, symbol string) {
+	log.Printf("NOTIFICATION: User %d - Auto-close features restored for %s. Position monitoring is active again.", userID, symbol)
+	// Здесь можно добавить реальную отправку уведомления (email, push и т.д.)
 }

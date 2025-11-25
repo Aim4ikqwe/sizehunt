@@ -21,6 +21,7 @@ import (
 
 	"github.com/adshao/go-binance/v2/futures"
 	"github.com/go-chi/chi/v5"
+	"github.com/sony/gobreaker"
 )
 
 type Handler struct {
@@ -57,6 +58,9 @@ func NewBinanceHandler(
 
 func (h *Handler) GetOrderBook(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
 	defer func() {
 		log.Printf("Handler: GetOrderBook completed (total time: %v)", time.Since(startTime))
 	}()
@@ -184,6 +188,9 @@ func (h *Handler) DeleteKeys(w http.ResponseWriter, r *http.Request) {
 }
 func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
 	defer func() {
 		log.Printf("Handler: CreateSignal completed (total time: %v)", time.Since(startTime))
 	}()
@@ -266,6 +273,11 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	var positionCheckDuration time.Duration
 	var positionAmt float64
 	if req.AutoClose {
+		if !h.isBinanceAPIAvailable() {
+			log.Printf("Handler: Binance API unavailable, cannot create auto-close signal")
+			http.Error(w, "Binance API temporarily unavailable. Cannot create auto-close signal.", http.StatusServiceUnavailable)
+			return
+		}
 		if req.Market != "futures" {
 			log.Printf("Handler: ERROR: AutoClose requested for non-futures market %s", req.Market)
 			http.Error(w, "AutoClose is only supported for futures market", http.StatusBadRequest)
@@ -663,4 +675,13 @@ func generateID() int64 {
 	// Реализуй как хочешь: UUID, auto-increment, etc.
 	// Пока просто временный вариант
 	return time.Now().UnixNano() % 1000000
+}
+func (h *Handler) isBinanceAPIAvailable() bool {
+	cb := h.BinanceService.GetFuturesCB() // Нужно добавить такой метод в Watcher
+	if cb == nil {
+		return true
+	}
+
+	state := cb.State()
+	return state == gobreaker.StateClosed || state == gobreaker.StateHalfOpen
 }

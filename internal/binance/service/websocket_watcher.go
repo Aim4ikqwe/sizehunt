@@ -16,6 +16,7 @@ import (
 	subscriptionservice "sizehunt/internal/subscription/service"
 
 	"github.com/adshao/go-binance/v2/futures"
+	"github.com/sony/gobreaker"
 )
 
 type Signal struct {
@@ -357,10 +358,8 @@ func (w *MarketDepthWatcher) StartConnection() error {
 
 func (w *MarketDepthWatcher) monitorActivity() {
 	log.Printf("MarketDepthWatcher: Activity monitoring started for market %s", w.market)
-
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(10 * time.Second) // Сокращено до 10 секунд
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ticker.C:
@@ -368,20 +367,15 @@ func (w *MarketDepthWatcher) monitorActivity() {
 			lastActivity := w.lastActivityTime
 			isStarted := w.started
 			w.mu.RUnlock()
-
 			inactiveDuration := time.Since(lastActivity)
-
 			if !isStarted {
 				log.Printf("MarketDepthWatcher: Not started yet, skipping activity check")
 				continue
 			}
-
 			log.Printf("MarketDepthWatcher: Last activity was %v ago for market %s", inactiveDuration, w.market)
-
-			if inactiveDuration > 5*time.Minute {
+			if inactiveDuration > 30*time.Second { // Сокращено до 30 секунд
 				log.Printf("MarketDepthWatcher: WARNING: No activity for %v, market %s might be disconnected",
 					inactiveDuration, w.market)
-
 				// Попробуем переподключиться
 				w.mu.Lock()
 				if w.started && w.client != nil {
@@ -389,7 +383,6 @@ func (w *MarketDepthWatcher) monitorActivity() {
 					w.client.Close()
 					w.client = nil
 					w.started = false
-
 					// Перезапускаем соединение
 					go func() {
 						if err := w.StartConnection(); err != nil {
@@ -401,7 +394,6 @@ func (w *MarketDepthWatcher) monitorActivity() {
 				}
 				w.mu.Unlock()
 			}
-
 		case <-w.ctx.Done():
 			log.Printf("MarketDepthWatcher: Activity monitoring stopped due to context cancellation")
 			return
@@ -895,4 +887,10 @@ func (w *MarketDepthWatcher) processDepthUpdateAsync(data *UnifiedDepthStreamDat
 
 		w.processDepthUpdate(data)
 	}()
+}
+func (w *Watcher) GetFuturesCB() *gobreaker.CircuitBreaker {
+	if httpClient, ok := w.client.(*BinanceHTTPClient); ok {
+		return httpClient.futuresCB
+	}
+	return nil
 }

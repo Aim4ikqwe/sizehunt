@@ -15,6 +15,8 @@ type SignalRepository interface {
 	Update(ctx context.Context, signal *SignalDB) error
 	Delete(ctx context.Context, signalID int64) error
 	Deactivate(ctx context.Context, signalID int64) error
+	GetByID(ctx context.Context, signalID int64) (*SignalDB, error)
+	GetInactiveAutoCloseSignals(ctx context.Context) ([]*SignalDB, error)
 }
 
 type PostgresSignalRepo struct {
@@ -160,4 +162,54 @@ func (r *PostgresSignalRepo) Deactivate(ctx context.Context, signalID int64) err
 		`UPDATE signals SET is_active = false, updated_at = NOW() WHERE id = $1`,
 		signalID)
 	return err
+}
+func (r *PostgresSignalRepo) GetByID(ctx context.Context, signalID int64) (*SignalDB, error) {
+	query := `
+        SELECT id, user_id, symbol, target_price, min_quantity, trigger_on_cancel, 
+               trigger_on_eat, eat_percentage, original_qty, last_qty, auto_close, 
+               close_market, watch_market, original_side, created_at, updated_at, is_active
+        FROM signals
+        WHERE id = $1
+    `
+	signal := &SignalDB{}
+	err := r.DB.QueryRowContext(ctx, query, signalID).Scan(
+		&signal.ID, &signal.UserID, &signal.Symbol, &signal.TargetPrice, &signal.MinQuantity,
+		&signal.TriggerOnCancel, &signal.TriggerOnEat, &signal.EatPercentage, &signal.OriginalQty,
+		&signal.LastQty, &signal.AutoClose, &signal.CloseMarket, &signal.WatchMarket, &signal.OriginalSide,
+		&signal.CreatedAt, &signal.UpdatedAt, &signal.IsActive,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return signal, nil
+}
+func (r *PostgresSignalRepo) GetInactiveAutoCloseSignals(ctx context.Context) ([]*SignalDB, error) {
+	query := `
+        SELECT id, user_id, symbol, target_price, min_quantity, trigger_on_cancel, 
+               trigger_on_eat, eat_percentage, original_qty, last_qty, auto_close, 
+               close_market, watch_market, original_side, created_at, updated_at, is_active
+        FROM signals
+        WHERE is_active = false AND auto_close = true
+        ORDER BY created_at DESC
+    `
+	rows, err := r.DB.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var signals []*SignalDB
+	for rows.Next() {
+		signal := &SignalDB{}
+		if err := rows.Scan(
+			&signal.ID, &signal.UserID, &signal.Symbol, &signal.TargetPrice, &signal.MinQuantity,
+			&signal.TriggerOnCancel, &signal.TriggerOnEat, &signal.EatPercentage, &signal.OriginalQty,
+			&signal.LastQty, &signal.AutoClose, &signal.CloseMarket, &signal.WatchMarket, &signal.OriginalSide,
+			&signal.CreatedAt, &signal.UpdatedAt, &signal.IsActive,
+		); err != nil {
+			return nil, err
+		}
+		signals = append(signals, signal)
+	}
+	return signals, nil
 }

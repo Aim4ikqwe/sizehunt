@@ -30,7 +30,9 @@ func NewOrderManager(futuresClient *futures.Client, watcher *PositionWatcher) *O
 
 // CloseFullPosition closes position using cached WS data.
 func (om *OrderManager) CloseFullPosition(symbol string) error {
+
 	startTime := time.Now()
+
 	defer func() {
 		log.Printf("OrderManager: CloseFullPosition for %s completed (total time: %v)", symbol, time.Since(startTime))
 	}()

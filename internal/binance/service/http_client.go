@@ -7,23 +7,60 @@ import (
 	"log"
 	"sizehunt/internal/binance/entity"
 	"strconv"
+	"time"
 
 	"github.com/adshao/go-binance/v2"         // Основной пакет (спот)
 	"github.com/adshao/go-binance/v2/futures" // Пакет фьючерсов
+	"github.com/sony/gobreaker"
 )
 
 type BinanceHTTPClient struct {
 	SpotClient    *binance.Client
 	FuturesClient *futures.Client
+	spotCB        *gobreaker.CircuitBreaker
+	futuresCB     *gobreaker.CircuitBreaker
 }
 
 func NewBinanceHTTPClient(apiKey, secretKey string) *BinanceHTTPClient {
-	client := &BinanceHTTPClient{}
+	// Настройка circuit breaker для спота
+	spotCB := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        "binance-spot",
+		MaxRequests: 3,
+		Interval:    5 * time.Minute,
+		Timeout:     30 * time.Second,
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+			return counts.Requests >= 10 && failureRatio >= 0.6
+		},
+		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+			log.Printf("CircuitBreaker %s changed state: %v -> %v", name, from, to)
+		},
+	})
+
+	// Настройка circuit breaker для фьючерсов
+	futuresCB := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        "binance-futures",
+		MaxRequests: 3,
+		Interval:    5 * time.Minute,
+		Timeout:     30 * time.Second,
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+			return counts.Requests >= 10 && failureRatio >= 0.6
+		},
+		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+			log.Printf("CircuitBreaker %s changed state: %v -> %v", name, from, to)
+		},
+	})
+
+	client := &BinanceHTTPClient{
+		spotCB:    spotCB,
+		futuresCB: futuresCB,
+	}
+
 	if apiKey != "" && secretKey != "" {
 		client.SpotClient = binance.NewClient(apiKey, secretKey)
 		client.FuturesClient = binance.NewFuturesClient(apiKey, secretKey)
 	} else {
-		// Создаём клиенты без ключей для публичных запросов
 		client.SpotClient = binance.NewClient("", "")
 		client.FuturesClient = binance.NewFuturesClient("", "")
 	}
@@ -39,6 +76,7 @@ func (c *BinanceHTTPClient) GetOrderBook(symbol string, limit int, market string
 		if c.FuturesClient == nil {
 			return nil, fmt.Errorf("futures client not initialized, API keys required")
 		}
+
 		service := c.FuturesClient.NewDepthService()
 		service.Symbol(symbol)
 		if limit > 0 {

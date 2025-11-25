@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -64,6 +65,13 @@ func main() {
 		signalRepo,
 		cfg,
 	)
+	go wsManager.StartConnectionMonitor()
+	log.Println("Loading active signals from database...")
+	if err := wsManager.LoadActiveSignals(); err != nil {
+		log.Printf("Failed to load active signals: %v", err)
+	} else {
+		log.Println("Active signals loaded successfully")
+	}
 
 	// --- Создаем сервер ДО инициализации обработчиков ---
 	server := &http.Server{
@@ -96,6 +104,39 @@ func main() {
 	r.Post("/auth/register", h.Register)
 	r.Post("/auth/login", h.Login)
 	r.Post("/auth/refresh", h.Refresh)
+	// Добавить новый эндпоинт для проверки состояния сети
+	r.Get("/health/network", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		client := http.Client{}
+		req, _ := http.NewRequestWithContext(ctx, "GET", "https://api.binance.com/api/v3/ping", nil)
+		resp, err := client.Do(req)
+
+		status := make(map[string]interface{})
+		status["timestamp"] = time.Now()
+
+		if err != nil {
+			status["status"] = "down"
+			status["error"] = err.Error()
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else if resp.StatusCode != http.StatusOK {
+			status["status"] = "down"
+			status["http_status"] = resp.StatusCode
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			status["status"] = "up"
+			status["latency_ms"] = time.Since(time.Now()).Milliseconds()
+			w.WriteHeader(http.StatusOK)
+		}
+
+		if resp != nil {
+			resp.Body.Close()
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(status)
+	})
 
 	// 🔐 Защищённая группа маршрутов
 	r.Group(func(pr chi.Router) {
