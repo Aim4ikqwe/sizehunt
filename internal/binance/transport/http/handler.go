@@ -187,7 +187,6 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		log.Printf("Handler: CreateSignal completed (total time: %v)", time.Since(startTime))
 	}()
-
 	// Восстанавливаем панику для предотвращения падения сервера
 	defer func() {
 		if r := recover(); r != nil {
@@ -195,9 +194,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 		}
 	}()
-
 	userID := r.Context().Value(middleware.UserIDKey).(int64)
-
 	// 1. Валидация входных данных (быстрые операции)
 	var req dto.CreateSignalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -205,16 +202,13 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-
 	if err := dto.Validate.Struct(req); err != nil {
 		log.Printf("Handler: ERROR: Validation failed in CreateSignal: %v", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
 	log.Printf("Handler: CreateSignal called for user %d, symbol %s, price %.8f, market %s, autoClose %v",
 		userID, req.Symbol, req.TargetPrice, req.Market, req.AutoClose)
-
 	// 2. Проверка подписки (быстрая операция с БД)
 	subscribed, err := h.SubscriptionService.IsUserSubscribed(r.Context(), userID)
 	if err != nil {
@@ -222,13 +216,11 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to check subscription", http.StatusInternalServerError)
 		return
 	}
-
 	if !subscribed {
 		log.Printf("Handler: User %d is not subscribed, blocking CreateSignal", userID)
 		http.Error(w, "subscription required", http.StatusForbidden)
 		return
 	}
-
 	// 3. Получение и расшифровка ключей (относительно быстрые операции)
 	keys, err := h.KeysRepo.GetKeys(userID)
 	if err != nil {
@@ -236,7 +228,6 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "API keys not found", http.StatusUnauthorized)
 		return
 	}
-
 	secret := h.Config.EncryptionSecret
 	apiKey, err := service.DecryptAES(keys.APIKey, secret)
 	if err != nil {
@@ -244,7 +235,6 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to decrypt API key", http.StatusInternalServerError)
 		return
 	}
-
 	secretKey, err := service.DecryptAES(keys.SecretKey, secret)
 	if err != nil {
 		log.Printf("Handler: ERROR: DecryptAES failed for Secret key for user %d: %v", userID, err)
@@ -252,75 +242,98 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Проверка позиции для auto-close (если требуется)
+	// 4. Проверка, есть ли уже активные сигналы для этой монеты у пользователя
+	existingSignals, err := h.SignalRepository.GetActiveByUserAndSymbol(r.Context(), userID, req.Symbol)
+	if err != nil {
+		log.Printf("Handler: ERROR: Failed to check existing signals for user %d, symbol %s: %v", userID, req.Symbol, err)
+		http.Error(w, "failed to check existing signals", http.StatusInternalServerError)
+		return
+	}
+
+	// 5. Деактивируем все существующие сигналы для этой монеты
+	for _, existingSignal := range existingSignals {
+		if err := h.SignalRepository.Deactivate(r.Context(), existingSignal.ID); err != nil {
+			log.Printf("Handler: WARNING: Failed to deactivate existing signal %d: %v", existingSignal.ID, err)
+		} else {
+			log.Printf("Handler: Deactivated existing signal %d for user %d, symbol %s", existingSignal.ID, userID, req.Symbol)
+		}
+
+		// Также удаляем сигнал из WebSocketManager
+		go h.WebSocketManager.DeleteUserSignal(userID, existingSignal.ID)
+	}
+
+	// 6. Проверка позиции для auto-close (если требуется)
 	var positionCheckDuration time.Duration
+	var positionAmt float64
 	if req.AutoClose {
 		if req.Market != "futures" {
 			log.Printf("Handler: ERROR: AutoClose requested for non-futures market %s", req.Market)
 			http.Error(w, "AutoClose is only supported for futures market", http.StatusBadRequest)
 			return
 		}
-
 		log.Printf("Handler: AutoClose enabled, checking position for %s", req.Symbol)
 		tempFuturesClient := futures.NewClient(apiKey, secretKey)
 		posStartTime := time.Now()
 		resp, err := tempFuturesClient.NewGetPositionRiskService().Symbol(req.Symbol).Do(r.Context())
 		positionCheckDuration = time.Since(posStartTime)
-
 		if err != nil {
 			log.Printf("Handler: ERROR: Failed to check position for auto-close: %v (took %v)", err, positionCheckDuration)
 			http.Error(w, "failed to verify position", http.StatusInternalServerError)
 			return
 		}
-
 		if len(resp) == 0 {
 			log.Printf("Handler: ERROR: No position data returned for symbol %s", req.Symbol)
 			http.Error(w, "no position data available", http.StatusBadRequest)
 			return
 		}
 
-		positionAmt := resp[0].PositionAmt
-		log.Printf("Handler: Current position for %s: %s", req.Symbol, positionAmt)
+		positionAmtStr := resp[0].PositionAmt
+		positionAmt, err = strconv.ParseFloat(positionAmtStr, 64)
+		if err != nil {
+			log.Printf("Handler: ERROR: Failed to parse position amount %s: %v", positionAmtStr, err)
+			http.Error(w, "invalid position data", http.StatusBadRequest)
+			return
+		}
 
-		if positionAmt == "0" || positionAmt == "0.00000000" || positionAmt == "0.0" {
+		log.Printf("Handler: Current position for %s: %s (%.6f)", req.Symbol, positionAmtStr, positionAmt)
+
+		// Если позиция нулевая, не создаем сигнал с auto-close
+		if positionAmt == 0 {
 			log.Printf("Handler: ERROR: Cannot create auto-close signal: position is zero for %s", req.Symbol)
 			http.Error(w, "cannot create auto-close signal: position is zero", http.StatusBadRequest)
 			return
 		}
 
-		log.Printf("Handler: Position for %s is %s, allowing auto-close signal (check took %v)",
+		log.Printf("Handler: Position for %s is %.6f, allowing auto-close signal (check took %v)",
 			req.Symbol, positionAmt, positionCheckDuration)
 	}
 
-	// 5. Получение ордербука (сетевая операция, но необходима)
+	// 7. Получение ордербука (сетевая операция, но необходима)
 	client := service.NewBinanceHTTPClient(apiKey, secretKey)
 	const initialBookLimit = 1000
 	bookStartTime := time.Now()
 	ob, err := client.GetOrderBook(req.Symbol, initialBookLimit, req.Market)
 	bookDuration := time.Since(bookStartTime)
-
 	if err != nil {
 		log.Printf("Handler: ERROR: GetOrderBook failed for symbol %s, market %s: %v (took %v)",
 			req.Symbol, req.Market, err, bookDuration)
 		http.Error(w, fmt.Sprintf("failed to fetch initial order book: %v", err), http.StatusInternalServerError)
 		return
 	}
-
 	log.Printf("Handler: Orderbook fetched successfully (took %v), contains %d bids and %d asks",
 		bookDuration, len(ob.Bids), len(ob.Asks))
 
-	// 6. Поиск заявки на целевой цене
+	// 8. Поиск заявки на целевой цене
 	initialQty, initialSide := h.findOrderAtPrice(ob, req.TargetPrice, req.MinQuantity)
 	if initialQty == 0 {
 		log.Printf("Handler: ERROR: No order found at price %.8f", req.TargetPrice)
 		http.Error(w, fmt.Sprintf("no order found at price %.8f", req.TargetPrice), http.StatusBadRequest)
 		return
 	}
-
 	log.Printf("Handler: Found order at target price: %.8f, quantity: %.4f, side: %s",
 		req.TargetPrice, initialQty, initialSide)
 
-	// 7. Создание структуры сигнала для БД
+	// 9. Создание структуры сигнала для БД
 	signalDB := &repository.SignalDB{
 		UserID:          userID,
 		Symbol:          req.Symbol,
@@ -339,7 +352,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		IsActive:        true,
 	}
 
-	// 8. Сохранение в БД (блокирующая операция, но необходима перед ответом)
+	// 10. Сохранение в БД (блокирующая операция, но необходима перед ответом)
 	saveStartTime := time.Now()
 	if err := h.SignalRepository.Save(r.Context(), signalDB); err != nil {
 		log.Printf("Handler: ERROR: Failed to save signal to database: %v (took %v)", err, time.Since(saveStartTime))
@@ -349,29 +362,25 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	saveDuration := time.Since(saveStartTime)
 	log.Printf("Handler: Signal saved to database with ID %d (took %v)", signalDB.ID, saveDuration)
 
-	// 9. Получение watcher'а с минимальным временем удержания блокировки
+	// 11. Получение watcher'а с минимальным временем удержания блокировки
 	log.Printf("Handler: Getting or creating watcher for user %d, symbol %s, market %s, autoClose %v",
 		userID, req.Symbol, req.Market, req.AutoClose)
-
 	watcherStartTime := time.Now()
 	watcher, err := h.WebSocketManager.GetOrCreateWatcherForUser(userID, req.Symbol, req.Market, req.AutoClose)
 	watcherDuration := time.Since(watcherStartTime)
-
 	if err != nil {
 		// При ошибке получения watcher'а - удаляем сигнал из БД
 		if delErr := h.SignalRepository.Delete(r.Context(), signalDB.ID); delErr != nil {
 			log.Printf("Handler: ERROR: Failed to clean up signal %d after watcher error: %v", signalDB.ID, delErr)
 		}
-
 		log.Printf("Handler: ERROR: Failed to get watcher for user %d, symbol %s: %v (took %v)",
 			userID, req.Symbol, err, watcherDuration)
 		http.Error(w, "failed to create watcher", http.StatusInternalServerError)
 		return
 	}
-
 	log.Printf("Handler: Watcher obtained successfully (took %v)", watcherDuration)
 
-	// 10. Создание сигнала для внутренней обработки
+	// 12. Создание сигнала для внутренней обработки
 	signal := &service.Signal{
 		ID:              signalDB.ID,
 		UserID:          signalDB.UserID,
@@ -390,7 +399,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:       signalDB.CreatedAt,
 	}
 
-	// 11. Формирование ответа до добавления сигнала в watcher
+	// 13. Формирование ответа до добавления сигнала в watcher
 	response := map[string]interface{}{
 		"message":          "signal created successfully",
 		"signal_id":        signal.ID,
@@ -400,16 +409,15 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		"side":             initialSide,
 	}
 
-	// 12. Отправка ответа клиенту
+	// 14. Отправка ответа клиенту
 	w.WriteHeader(http.StatusCreated)
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Handler: ERROR: Failed to encode CreateSignal response: %v", err)
 	}
 
-	// 13. Асинхронное добавление сигнала в watcher
+	// 15. Асинхронное добавление сигнала в watcher
 	log.Printf("Handler: Adding signal %d to watcher for user %d, symbol %s, initialQty %.4f, side %s (async)",
 		signal.ID, userID, req.Symbol, initialQty, initialSide)
-
 	go func() {
 		addSignalStartTime := time.Now()
 		watcher.AddSignal(signal)

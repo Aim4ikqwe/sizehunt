@@ -8,6 +8,7 @@ import (
 	"sizehunt/internal/binance/repository"
 	"sizehunt/internal/config"
 	subscriptionservice "sizehunt/internal/subscription/service"
+	"strconv"
 	"sync"
 	"time"
 
@@ -58,84 +59,103 @@ func NewWebSocketManager(
 }
 
 // Загружаем все активные сигналы из БД при старте
+// Загружаем все активные сигналы из БД при старте
 func (m *WebSocketManager) LoadActiveSignals() error {
-	// Получаем все уникальные user_id из активных сигналов
-	query := `SELECT DISTINCT user_id FROM signals WHERE is_active = true`
-	rows, err := m.signalRepo.(*repository.PostgresSignalRepo).DB.Query(query)
-	if err != nil {
-		return fmt.Errorf("failed to get active users: %w", err)
-	}
-	defer rows.Close()
+	log.Println("WebSocketManager: Loading active signals from database")
 
-	var userIDs []int64
-	for rows.Next() {
-		var userID int64
-		if err := rows.Scan(&userID); err != nil {
-			return fmt.Errorf("failed to scan user_id: %w", err)
-		}
-		userIDs = append(userIDs, userID)
+	// Получаем все активные сигналы
+	signals, err := m.signalRepo.GetAllActiveSignals(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to get all active signals: %w", err)
+	}
+
+	log.Printf("WebSocketManager: Found %d active signals in database", len(signals))
+
+	// Группируем сигналы по пользователю
+	userSignals := make(map[int64][]*repository.SignalDB)
+	for _, signal := range signals {
+		userSignals[signal.UserID] = append(userSignals[signal.UserID], signal)
 	}
 
 	// Для каждого пользователя загружаем его сигналы
-	for _, userID := range userIDs {
-		// Загружаем сигналы асинхронно для каждого пользователя
-		go func(userID int64) {
-			signals, err := m.signalRepo.GetActiveByUserID(context.Background(), userID)
-			if err != nil {
-				log.Printf("WebSocketManager: WARNING: Failed to load signals for user %d: %v", userID, err)
-				return
+	for userID, signals := range userSignals {
+		log.Printf("WebSocketManager: Processing %d signals for user %d", len(signals), userID)
+
+		// Создаем UserWatcher для пользователя
+		m.mu.Lock()
+		uw, exists := m.userWatchers[userID]
+		if !exists {
+			uw = &UserWatcher{
+				spotWatchers:     make(map[string]*MarketDepthWatcher),
+				futuresWatchers:  make(map[string]*MarketDepthWatcher),
+				signalRepository: m.signalRepo,
 			}
-			log.Printf("WebSocketManager: Loading %d active signals for user %d", len(signals), userID)
+			m.userWatchers[userID] = uw
+		}
+		m.mu.Unlock()
 
-			// Создаем UserWatcher для пользователя (без инициализации ресурсов)
-			m.mu.Lock()
-			uw, exists := m.userWatchers[userID]
-			if !exists {
-				uw = &UserWatcher{
-					spotWatchers:     make(map[string]*MarketDepthWatcher),
-					futuresWatchers:  make(map[string]*MarketDepthWatcher),
-					signalRepository: m.signalRepo,
-				}
-				m.userWatchers[userID] = uw
+		// Обрабатываем каждый сигнал пользователя
+		for _, signalDB := range signals {
+			// Проверяем права доступа к API ключам пользователя
+			hasKeys, apiKey, secretKey := m.getKeysForUser(userID)
+			if !hasKeys {
+				log.Printf("WebSocketManager: WARNING: No API keys for user %d. Signal %d for %s will not work properly.",
+					userID, signalDB.ID, signalDB.Symbol)
 			}
-			m.mu.Unlock()
 
-			// Инициализируем watcher'ы и добавляем сигналы
-			for _, signalDB := range signals {
-				// Копируем данные для использования в горутине
-				signalCopy := signalDB
-
-				// Создаем watcher без блокировки основного мьютекса
-				watcher, err := m.createWatcherForUser(userID, signalCopy.Symbol, signalCopy.WatchMarket, signalCopy.AutoClose)
+			// Проверяем позицию для сигналов с auto-close
+			if signalDB.AutoClose && hasKeys {
+				// Создаем временный клиент для проверки позиции
+				tempFuturesClient := futures.NewClient(apiKey, secretKey)
+				resp, err := tempFuturesClient.NewGetPositionRiskService().Symbol(signalDB.Symbol).Do(context.Background())
 				if err != nil {
-					log.Printf("WebSocketManager: ERROR: Failed to create watcher for signal %d: %v", signalCopy.ID, err)
-					continue
+					log.Printf("WebSocketManager: WARNING: Failed to check position for signal %d: %v", signalDB.ID, err)
+				} else if len(resp) > 0 {
+					positionAmt, _ := strconv.ParseFloat(resp[0].PositionAmt, 64)
+					if positionAmt == 0 {
+						log.Printf("WebSocketManager: INFO: Position is zero for signal %d symbol %s. Deactivating signal.",
+							signalDB.ID, signalDB.Symbol)
+						// Деактивируем сигнал, так как позиция нулевая
+						if err := m.signalRepo.Deactivate(context.Background(), signalDB.ID); err != nil {
+							log.Printf("WebSocketManager: WARNING: Failed to deactivate signal %d: %v", signalDB.ID, err)
+						}
+						continue
+					}
 				}
-
-				// Добавляем сигнал асинхронно
-				go watcher.AddSignalAsync(&Signal{
-					ID:              signalCopy.ID,
-					UserID:          signalCopy.UserID,
-					Symbol:          signalCopy.Symbol,
-					TargetPrice:     signalCopy.TargetPrice,
-					MinQuantity:     signalCopy.MinQuantity,
-					TriggerOnCancel: signalCopy.TriggerOnCancel,
-					TriggerOnEat:    signalCopy.TriggerOnEat,
-					EatPercentage:   signalCopy.EatPercentage,
-					OriginalQty:     signalCopy.OriginalQty,
-					LastQty:         signalCopy.LastQty,
-					AutoClose:       signalCopy.AutoClose,
-					CloseMarket:     signalCopy.CloseMarket,
-					WatchMarket:     signalCopy.WatchMarket,
-					OriginalSide:    signalCopy.OriginalSide,
-					CreatedAt:       signalCopy.CreatedAt,
-				})
-
-				log.Printf("WebSocketManager: Loaded signal %d for user %d, symbol %s", signalCopy.ID, userID, signalCopy.Symbol)
 			}
-		}(userID)
+
+			log.Printf("WebSocketManager: Loading signal %d for user %d, symbol %s",
+				signalDB.ID, userID, signalDB.Symbol)
+
+			// Создаем watcher для сигнала
+			watcher, err := m.createWatcherForUser(userID, signalDB.Symbol, signalDB.WatchMarket, signalDB.AutoClose)
+			if err != nil {
+				log.Printf("WebSocketManager: ERROR: Failed to create watcher for signal %d: %v", signalDB.ID, err)
+				continue
+			}
+
+			// Добавляем сигнал в watcher
+			watcher.AddSignal(&Signal{
+				ID:              signalDB.ID,
+				UserID:          signalDB.UserID,
+				Symbol:          signalDB.Symbol,
+				TargetPrice:     signalDB.TargetPrice,
+				MinQuantity:     signalDB.MinQuantity,
+				TriggerOnCancel: signalDB.TriggerOnCancel,
+				TriggerOnEat:    signalDB.TriggerOnEat,
+				EatPercentage:   signalDB.EatPercentage,
+				OriginalQty:     signalDB.OriginalQty,
+				LastQty:         signalDB.LastQty,
+				AutoClose:       signalDB.AutoClose,
+				CloseMarket:     signalDB.CloseMarket,
+				WatchMarket:     signalDB.WatchMarket,
+				OriginalSide:    signalDB.OriginalSide,
+				CreatedAt:       signalDB.CreatedAt,
+			})
+		}
 	}
 
+	log.Println("WebSocketManager: All active signals loaded successfully")
 	return nil
 }
 
