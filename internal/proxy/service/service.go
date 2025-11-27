@@ -71,25 +71,26 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 	}
 
 	// Создаем новый контейнер
-	portStr := fmt.Sprintf("%d/tcp", config.LocalPort)
+	containerPort := nat.Port("1080/tcp")
 	portBinding := nat.PortBinding{
 		HostIP:   "127.0.0.1",
 		HostPort: fmt.Sprintf("%d", config.LocalPort),
 	}
 	portMap := nat.PortMap{}
-	portMap[nat.Port(portStr)] = []nat.PortBinding{portBinding}
+	portMap[containerPort] = []nat.PortBinding{portBinding}
 
 	exposedPorts := nat.PortSet{}
-	exposedPorts[nat.Port(portStr)] = struct{}{}
+	exposedPorts[nat.Port(containerPort)] = struct{}{}
 	resp, err := s.dockerCli.ContainerCreate(ctx, &container.Config{
 		Image: "shadowsocks/shadowsocks-libev:edge",
 		Cmd: []string{
 			"ss-local",
 			"-s", config.SSAddr,
-			"-p", "443",
+			"-p", "8388",
 			"-m", config.SSMethod,
 			"-k", config.SSPassword,
-			"-l", fmt.Sprintf("%d", config.LocalPort),
+			"-b", "0.0.0.0",
+			"-l", fmt.Sprintf("%d", 1080),
 			"-u",
 			"--fast-open",
 		},

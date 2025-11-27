@@ -61,7 +61,7 @@ func NewBinanceHTTPClientWithProxy(apiKey, secretKey, proxyAddr string, cfg *con
 	var httpClient *http.Client
 	if proxyAddr != "" {
 		proxyURL := &url.URL{
-			Scheme: "socks5",
+			Scheme: "socks5h",
 			Host:   proxyAddr,
 		}
 
