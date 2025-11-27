@@ -70,6 +70,7 @@ type MarketDepthWatcher struct {
 	lastActivityTime    time.Time // время последней активности
 	signalRepository    binance_repository.SignalRepository
 	WebSocketManager    *WebSocketManager
+	UserID              int64
 }
 
 func NewMarketDepthWatcher(
@@ -83,6 +84,7 @@ func NewMarketDepthWatcher(
 	userDataStream *UserDataStream,
 	signalRepo binance_repository.SignalRepository,
 	wsManager *WebSocketManager,
+	userID int64,
 ) *MarketDepthWatcher {
 	// Инициализируем мапы
 	signalsBySymbol := make(map[string][]*Signal)
@@ -109,6 +111,7 @@ func NewMarketDepthWatcher(
 		lastActivityTime:    time.Now(),
 		signalRepository:    signalRepo,
 		WebSocketManager:    wsManager,
+		UserID:              userID,
 	}
 
 	log.Printf("MarketDepthWatcher: Created new watcher for market %s (creation time: %v)", market, watcher.creationTime)
@@ -298,7 +301,22 @@ func (w *MarketDepthWatcher) StartConnection() error {
 
 	log.Printf("MarketDepthWatcher: Starting connection for market %s", w.market)
 
-	client := NewWebSocketClient()
+	// Получаем прокси адрес для пользователя
+	var proxyAddr string
+	if w.WebSocketManager != nil {
+		if addr, ok := w.WebSocketManager.GetProxyAddressForUser(w.UserID); ok {
+			proxyAddr = addr
+		}
+	}
+
+	// Создаем клиент с поддержкой прокси
+	var client *WebSocketClient
+	if proxyAddr != "" {
+		client = NewWebSocketClientWithProxy(proxyAddr)
+	} else {
+		client = NewWebSocketClient()
+	}
+
 	client.OnData = func(data *UnifiedDepthStreamData) {
 		w.lastActivityTime = time.Now()
 		w.processDepthUpdateAsync(data)
@@ -325,7 +343,6 @@ func (w *MarketDepthWatcher) StartConnection() error {
 	case "spot":
 		log.Printf("MarketDepthWatcher: Connecting to spot combined WebSocket for %d symbols", len(symbols))
 		err = client.ConnectForSpotCombined(w.ctx, symbols)
-
 	case "futures":
 		symbolLevels := make(map[string]string)
 		for _, symbol := range symbols {

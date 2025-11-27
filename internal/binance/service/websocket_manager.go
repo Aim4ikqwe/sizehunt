@@ -4,16 +4,16 @@ package service
 import (
 	"context"
 	"fmt"
+	"github.com/adshao/go-binance/v2/futures"
 	"log"
 	"net/http"
 	"sizehunt/internal/binance/repository"
 	"sizehunt/internal/config"
+	proxy_service "sizehunt/internal/proxy/service"
 	subscriptionservice "sizehunt/internal/subscription/service"
 	"strconv"
 	"sync"
 	"time"
-
-	"github.com/adshao/go-binance/v2/futures"
 )
 
 // UserWatcher хранит watcher'ы по символам для одного пользователя
@@ -42,6 +42,7 @@ type WebSocketManager struct {
 	networkStatus     string // "up" или "down"
 	lastNetworkChange time.Time
 	networkMu         sync.Mutex
+	proxyService      *proxy_service.ProxyService
 }
 
 func NewWebSocketManager(
@@ -50,6 +51,7 @@ func NewWebSocketManager(
 	keysRepo *repository.PostgresKeysRepo,
 	signalRepo repository.SignalRepository,
 	cfg *config.Config,
+	proxyService *proxy_service.ProxyService,
 ) *WebSocketManager {
 	manager := &WebSocketManager{
 		userWatchers: make(map[int64]*UserWatcher),
@@ -58,6 +60,7 @@ func NewWebSocketManager(
 		signalRepo:   signalRepo,
 		cfg:          cfg,
 		ctx:          ctx,
+		proxyService: proxyService,
 	}
 	log.Println("WebSocketManager: Initialized successfully")
 	return manager
@@ -209,7 +212,7 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 		// Создаем новый watcher (без инициализации соединения)
 		log.Printf("WebSocketManager: Creating new spot watcher for user %d, symbol %s", userID, symbol)
 		watcher = NewMarketDepthWatcher(
-			m.ctx, "spot", m.subService, m.keysRepo, m.cfg, nil, nil, nil, m.signalRepo, m,
+			m.ctx, "spot", m.subService, m.keysRepo, m.cfg, nil, nil, nil, m.signalRepo, m, userID,
 		)
 		uw.spotWatchers[symbol] = watcher
 	case "futures":
@@ -293,6 +296,7 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 			userDataStream,
 			m.signalRepo,
 			m,
+			userID,
 		)
 		uw.futuresWatchers[symbol] = watcher
 	default:
@@ -915,4 +919,10 @@ func (m *WebSocketManager) checkPositionForSignal(signalDB *repository.SignalDB)
 func (m *WebSocketManager) notifyUserAboutRestoredFeature(userID int64, symbol string) {
 	log.Printf("NOTIFICATION: User %d - Auto-close features restored for %s. Position monitoring is active again.", userID, symbol)
 	// Здесь можно добавить реальную отправку уведомления (email, push и т.д.)
+}
+func (m *WebSocketManager) GetProxyAddressForUser(userID int64) (string, bool) {
+	if m.proxyService != nil {
+		return m.proxyService.GetProxyAddressForUser(userID)
+	}
+	return "", false
 }

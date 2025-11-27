@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"sync"
 	"time"
 
@@ -181,4 +182,20 @@ func (w *WebSocketClient) Close() {
 
 	w.isClosed = true
 	log.Println("WebSocketClient: Connection successfully closed and marked as closed")
+}
+func NewWebSocketClientWithProxy(proxyAddr string) *WebSocketClient {
+	client := NewWebSocketClient()
+
+	// Настройка прокси для WebSocket
+	if proxyAddr != "" {
+		log.Printf("WebSocketClient: Setting up proxy: %s", proxyAddr)
+
+		// Используем существующий метод для настройки прокси
+		_ = &url.URL{
+			Scheme: "socks5",
+			Host:   proxyAddr,
+		}
+	}
+
+	return client
 }

@@ -1,82 +1,134 @@
-// internal/binance/service/http_client.go
 package service
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	"net/url"
 	"sizehunt/internal/binance/entity"
+	"sizehunt/internal/config"
 	"strconv"
 	"time"
 
-	"github.com/adshao/go-binance/v2"         // Основной пакет (спот)
-	"github.com/adshao/go-binance/v2/futures" // Пакет фьючерсов
+	"github.com/adshao/go-binance/v2"
+	"github.com/adshao/go-binance/v2/futures"
 	"github.com/sony/gobreaker"
+	"golang.org/x/net/proxy"
 )
 
 type BinanceHTTPClient struct {
 	SpotClient    *binance.Client
 	FuturesClient *futures.Client
-	spotCB        *gobreaker.CircuitBreaker
-	futuresCB     *gobreaker.CircuitBreaker
+	futuresCB     *gobreaker.CircuitBreaker // Добавляем circuit breaker для фьючерсов
+	spotCB        *gobreaker.CircuitBreaker // Добавляем circuit breaker для спота
 }
 
-func NewBinanceHTTPClient(apiKey, secretKey string) *BinanceHTTPClient {
-	// Настройка circuit breaker для спота
-	spotCB := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+// NewBinanceHTTPClientWithProxy creates a new client with SOCKS5 proxy support
+func NewBinanceHTTPClientWithProxy(apiKey, secretKey, proxyAddr string, cfg *config.Config) *BinanceHTTPClient {
+	client := &BinanceHTTPClient{}
+
+	// Настройка circuit breakers
+	client.futuresCB = gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        "binance-futures",
+		MaxRequests: 3, // минимальное количество запросов для открытия цепи
+		Interval:    5 * time.Second,
+		Timeout:     30 * time.Second,
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+			return counts.Requests >= 3 && failureRatio >= 0.6
+		},
+		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+			log.Printf("Circuit breaker '%s' changed from %s to %s", name, from, to)
+		},
+	})
+
+	client.spotCB = gobreaker.NewCircuitBreaker(gobreaker.Settings{
 		Name:        "binance-spot",
 		MaxRequests: 3,
-		Interval:    5 * time.Minute,
+		Interval:    5 * time.Second,
 		Timeout:     30 * time.Second,
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
 			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-			return counts.Requests >= 10 && failureRatio >= 0.6
+			return counts.Requests >= 3 && failureRatio >= 0.6
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
-			log.Printf("CircuitBreaker %s changed state: %v -> %v", name, from, to)
+			log.Printf("Circuit breaker '%s' changed from %s to %s", name, from, to)
 		},
 	})
+	// Create HTTP client with SOCKS5 proxy if provided
+	var httpClient *http.Client
+	if proxyAddr != "" {
+		proxyURL := &url.URL{
+			Scheme: "socks5",
+			Host:   proxyAddr,
+		}
 
-	// Настройка circuit breaker для фьючерсов
-	futuresCB := gobreaker.NewCircuitBreaker(gobreaker.Settings{
-		Name:        "binance-futures",
-		MaxRequests: 3,
-		Interval:    5 * time.Minute,
-		Timeout:     30 * time.Second,
-		ReadyToTrip: func(counts gobreaker.Counts) bool {
-			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-			return counts.Requests >= 10 && failureRatio >= 0.6
-		},
-		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
-			log.Printf("CircuitBreaker %s changed state: %v -> %v", name, from, to)
-		},
-	})
-
-	client := &BinanceHTTPClient{
-		spotCB:    spotCB,
-		futuresCB: futuresCB,
+		dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+		if err != nil {
+			log.Printf("Failed to create SOCKS5 dialer: %v", err)
+		} else {
+			transport := &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return dialer.Dial(network, addr)
+				},
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			}
+			httpClient = &http.Client{
+				Transport: transport,
+				Timeout:   30 * time.Second,
+			}
+		}
 	}
 
+	// Initialize clients with proper options
 	if apiKey != "" && secretKey != "" {
-		client.SpotClient = binance.NewClient(apiKey, secretKey)
-		client.FuturesClient = binance.NewFuturesClient(apiKey, secretKey)
+		// Spot client
+		if httpClient != nil {
+			client.SpotClient = binance.NewClient(apiKey, secretKey)
+			client.SpotClient.HTTPClient = httpClient
+		} else {
+			client.SpotClient = binance.NewClient(apiKey, secretKey)
+		}
+
+		// Futures client
+		if httpClient != nil {
+			client.FuturesClient = futures.NewClient(apiKey, secretKey)
+			client.FuturesClient.HTTPClient = httpClient
+		} else {
+			client.FuturesClient = futures.NewClient(apiKey, secretKey)
+		}
 	} else {
-		client.SpotClient = binance.NewClient("", "")
-		client.FuturesClient = binance.NewFuturesClient("", "")
+		// Public clients without API keys
+		if httpClient != nil {
+			client.SpotClient = binance.NewClient("", "")
+			client.SpotClient.HTTPClient = httpClient
+			client.FuturesClient = futures.NewClient("", "")
+			client.FuturesClient.HTTPClient = httpClient
+		} else {
+			client.SpotClient = binance.NewClient("", "")
+			client.FuturesClient = futures.NewClient("", "")
+		}
 	}
+
 	return client
 }
 
-func (c *BinanceHTTPClient) GetOrderBook(symbol string, limit int, market string) (*OrderBook, error) {
-	var bidsData interface{} // Может быть [][]string (для спота) или []futures.Bid/Ask (для фьючерсов)
-	var asksData interface{}
+func NewBinanceHTTPClient(apiKey, secretKey string) *BinanceHTTPClient {
+	return NewBinanceHTTPClientWithProxy(apiKey, secretKey, "", nil)
+}
 
+func (c *BinanceHTTPClient) GetOrderBook(symbol string, limit int, market string) (*OrderBook, error) {
+	var bidsData interface{}
+	var asksData interface{}
 	switch market {
 	case "futures":
 		if c.FuturesClient == nil {
 			return nil, fmt.Errorf("futures client not initialized, API keys required")
 		}
-
 		service := c.FuturesClient.NewDepthService()
 		service.Symbol(symbol)
 		if limit > 0 {
@@ -86,8 +138,8 @@ func (c *BinanceHTTPClient) GetOrderBook(symbol string, limit int, market string
 		if err != nil {
 			return nil, err
 		}
-		bidsData = resp.Bids // Тип: []futures.Bid
-		asksData = resp.Asks // Тип: []futures.Ask
+		bidsData = resp.Bids
+		asksData = resp.Asks
 	case "spot":
 		fallthrough
 	default:
@@ -103,8 +155,9 @@ func (c *BinanceHTTPClient) GetOrderBook(symbol string, limit int, market string
 		if err != nil {
 			return nil, err
 		}
-		bidsData = resp.Bids // Тип: [][]string
-		asksData = resp.Asks // Тип: [][]string
+		bidsData = resp.Bids
+		asksData = resp.Asks
+
 	}
 
 	// Преобразуем bids
@@ -170,15 +223,12 @@ func (c *BinanceHTTPClient) GetOrderBook(symbol string, limit int, market string
 		log.Printf("GetOrderBook: Unexpected asks data type: %T", asksData)
 		return nil, fmt.Errorf("unexpected asks data type: %T", asksData)
 	}
-
 	return &OrderBook{Bids: bids, Asks: asks}, nil
 }
 
 func (c *BinanceHTTPClient) ValidateAPIKey() error {
-	// Простая проверка, что ключи не пустые
 	if c.SpotClient.APIKey == "" && c.FuturesClient.APIKey == "" {
 		return fmt.Errorf("API key is empty")
 	}
-	// Для более точной проверки можно сделать запрос, например, к /api/v3/account
 	return nil
 }

@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	repository2 "sizehunt/internal/proxy/repository"
+	"sizehunt/internal/proxy/service"
+	http2 "sizehunt/internal/proxy/transport/http"
 	"syscall"
 	"time"
 
@@ -48,7 +51,10 @@ func main() {
 	userService := userservice.NewUserService(userRepo)
 	refreshTokenRepo := tokenrepository.NewRefreshTokenRepository(database)
 	h := userhttp.NewHandler(userService, cfg.JWTSecret, refreshTokenRepo)
-
+	// Proxy
+	proxyRepo := repository2.NewPostgresProxyRepo(database)
+	proxyService := service.NewProxyService(proxyRepo)
+	proxyHandler := http2.NewProxyHandler(proxyService)
 	// Binance
 	keysRepo := repository.NewPostgresKeysRepo(database)
 	dbx := sqlx.NewDb(database, "postgres") // Конвертируем *sql.DB в *sqlx.DB
@@ -64,6 +70,7 @@ func main() {
 		keysRepo,
 		signalRepo,
 		cfg,
+		proxyService,
 	)
 	go wsManager.StartConnectionMonitor()
 	log.Println("Loading active signals from database...")
@@ -79,7 +86,7 @@ func main() {
 	}
 
 	// Передаем сервер в обработчик Binance
-	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager, subService, server, signalRepo)
+	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager, subService, server, signalRepo, proxyService)
 	subHandler := subscriptionhttp.NewSubscriptionHandler(subService)
 	log.Println("Loading active signals from database...")
 	if err := wsManager.LoadActiveSignals(); err != nil {
@@ -145,6 +152,11 @@ func main() {
 			id := r.Context().Value(middleware.UserIDKey).(int64)
 			w.Write([]byte(fmt.Sprintf("Your user ID: %d", id)))
 		})
+
+		// Proxy routes - добавляем эти маршруты
+		pr.Post("/api/proxy", proxyHandler.SaveProxyConfig)
+		pr.Delete("/api/proxy", proxyHandler.DeleteProxyConfig)
+		pr.Get("/api/proxy/status", proxyHandler.GetProxyStatus)
 
 		// Binance routes
 		pr.Get("/api/binance/book", binanceHandler.GetOrderBook)

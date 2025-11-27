@@ -14,6 +14,7 @@ import (
 	"sizehunt/internal/binance/repository"
 	"sizehunt/internal/binance/service"
 	"sizehunt/internal/config"
+	proxy_service "sizehunt/internal/proxy/service"
 	subscriptionservice "sizehunt/internal/subscription/service"
 	"sizehunt/pkg/middleware"
 	"strconv"
@@ -32,6 +33,7 @@ type Handler struct {
 	SubscriptionService *subscriptionservice.Service
 	Server              *http.Server
 	SignalRepository    repository.SignalRepository
+	ProxyService        *proxy_service.ProxyService
 }
 
 func NewBinanceHandler(
@@ -42,6 +44,7 @@ func NewBinanceHandler(
 	subService *subscriptionservice.Service,
 	server *http.Server,
 	signalRepo repository.SignalRepository,
+	proxyService *proxy_service.ProxyService,
 ) *Handler {
 	handler := &Handler{
 		BinanceService:      watcher,
@@ -51,6 +54,7 @@ func NewBinanceHandler(
 		SubscriptionService: subService,
 		Server:              server,
 		SignalRepository:    signalRepo,
+		ProxyService:        proxyService,
 	}
 	log.Println("BinanceHandler: Initialized successfully")
 	return handler
@@ -64,12 +68,15 @@ func (h *Handler) GetOrderBook(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		log.Printf("Handler: GetOrderBook completed (total time: %v)", time.Since(startTime))
 	}()
+
 	symbol := r.URL.Query().Get("symbol")
 	limitStr := r.URL.Query().Get("limit")
-	market := r.URL.Query().Get("market") // "spot" или "futures"
+	market := r.URL.Query().Get("market")
 	userID := r.Context().Value(middleware.UserIDKey).(int64)
+
 	log.Printf("Handler: GetOrderBook called by user %d, symbol: %s, limit: %s, market: %s",
 		userID, symbol, limitStr, market)
+
 	if symbol == "" {
 		http.Error(w, "symbol parameter is required", http.StatusBadRequest)
 		return
@@ -82,19 +89,23 @@ func (h *Handler) GetOrderBook(w http.ResponseWriter, r *http.Request) {
 	if limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil {
 			limit = l
-			log.Printf("Handler: Limit set to %d", limit)
-		} else {
-			log.Printf("Handler: WARNING: Invalid limit parameter: %s, using default %d", limitStr, limit)
 		}
 	}
-	// Получаем API-ключи пользователя
+
+	// 🔒 СТРОГАЯ ПРОВЕРКА: прокси обязан быть
+	if _, hasProxy := h.ProxyService.GetProxyAddressForUser(userID); !hasProxy {
+		log.Printf("Handler: ERROR: Proxy not configured for user %d. Required for GetOrderBook.", userID)
+		http.Error(w, "proxy configuration is required", http.StatusForbidden)
+		return
+	}
+
+	// Получаем API-ключи
 	keys, err := h.KeysRepo.GetKeys(userID)
 	if err != nil {
 		log.Printf("Handler: ERROR: GetKeys failed for user %d: %v", userID, err)
 		http.Error(w, "API keys not found", http.StatusUnauthorized)
 		return
 	}
-	// Расшифровываем ключи
 	secret := h.Config.EncryptionSecret
 	apiKey, err := service.DecryptAES(keys.APIKey, secret)
 	if err != nil {
@@ -102,13 +113,18 @@ func (h *Handler) GetOrderBook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to decrypt API key", http.StatusInternalServerError)
 		return
 	}
-	client := service.NewBinanceHTTPClient(apiKey, "") // Передаём apiKey, secretKey не нужен для публичных запросов
+
+	// 🔒 Прокси есть — используем его
+	proxyAddr, _ := h.ProxyService.GetProxyAddressForUser(userID)
+	client := service.NewBinanceHTTPClientWithProxy(apiKey, "", proxyAddr, h.Config)
+
 	ob, err := client.GetOrderBook(symbol, limit, market)
 	if err != nil {
 		log.Printf("Handler: ERROR: GetOrderBook failed for symbol %s, market %s: %v", symbol, market, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
 	log.Printf("Handler: Successfully retrieved orderbook for %s, market %s, limit %d", symbol, market, limit)
 	log.Printf("Handler: Orderbook contains %d bids and %d asks", len(ob.Bids), len(ob.Asks))
 	w.Header().Set("Content-Type", "application/json")
@@ -321,7 +337,13 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 7. Получение ордербука (сетевая операция, но необходима)
-	client := service.NewBinanceHTTPClient(apiKey, secretKey)
+	if _, hasProxy := h.ProxyService.GetProxyAddressForUser(userID); !hasProxy {
+		log.Printf("Handler: ERROR: Proxy not configured for user %d. Required to create signal.", userID)
+		http.Error(w, "proxy configuration is required", http.StatusForbidden)
+		return
+	}
+	proxyAddr, _ := h.ProxyService.GetProxyAddressForUser(userID)
+	client := service.NewBinanceHTTPClientWithProxy(apiKey, secretKey, proxyAddr, h.Config)
 	const initialBookLimit = 1000
 	bookStartTime := time.Now()
 	ob, err := client.GetOrderBook(req.Symbol, initialBookLimit, req.Market)
@@ -480,9 +502,10 @@ func (h *Handler) GetOrderAtPrice(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		log.Printf("Handler: GetOrderAtPrice completed (total time: %v)", time.Since(startTime))
 	}()
+
 	symbol := r.URL.Query().Get("symbol")
 	priceStr := r.URL.Query().Get("price")
-	market := r.URL.Query().Get("market") // "spot" или "futures"
+	market := r.URL.Query().Get("market")
 	if symbol == "" || priceStr == "" {
 		log.Printf("Handler: ERROR: Missing required parameters in GetOrderAtPrice: symbol=%s, price=%s", symbol, priceStr)
 		http.Error(w, "symbol and price are required", http.StatusBadRequest)
@@ -495,13 +518,21 @@ func (h *Handler) GetOrderAtPrice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if market == "" {
-		market = "futures" // по умолчанию
+		market = "futures"
 		log.Printf("Handler: Default market set to %s for GetOrderAtPrice", market)
 	}
-	// Получаем userID
+
 	userID := r.Context().Value(middleware.UserIDKey).(int64)
 	log.Printf("Handler: GetOrderAtPrice called by user %d, symbol=%s, price=%.8f, market=%s",
 		userID, symbol, price, market)
+
+	// 🔒 СТРОГАЯ ПРОВЕРКА: прокси обязан быть
+	if _, hasProxy := h.ProxyService.GetProxyAddressForUser(userID); !hasProxy {
+		log.Printf("Handler: ERROR: Proxy not configured for user %d. Required for GetOrderAtPrice.", userID)
+		http.Error(w, "proxy configuration is required", http.StatusForbidden)
+		return
+	}
+
 	// Проверяем подписку
 	subscribed, err := h.SubscriptionService.IsUserSubscribed(r.Context(), userID)
 	if err != nil {
@@ -514,6 +545,7 @@ func (h *Handler) GetOrderAtPrice(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "subscription required", http.StatusForbidden)
 		return
 	}
+
 	// Получаем API-ключи
 	keys, err := h.KeysRepo.GetKeys(userID)
 	if err != nil {
@@ -528,22 +560,22 @@ func (h *Handler) GetOrderAtPrice(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to decrypt API key", http.StatusInternalServerError)
 		return
 	}
-	// Получаем ордербук
-	client := service.NewBinanceHTTPClient(apiKey, "")   // apiKey, secretKey не нужен для публичных запросов
-	ob, err := client.GetOrderBook(symbol, 1000, market) // 1000 — максимум
+
+	// 🔒 Прокси есть — используем его
+	proxyAddr, _ := h.ProxyService.GetProxyAddressForUser(userID)
+	client := service.NewBinanceHTTPClientWithProxy(apiKey, "", proxyAddr, h.Config)
+
+	ob, err := client.GetOrderBook(symbol, 1000, market)
 	if err != nil {
 		log.Printf("Handler: ERROR: GetOrderBook failed in GetOrderAtPrice: %v", err)
 		http.Error(w, "failed to get order book", http.StatusInternalServerError)
 		return
 	}
-	log.Printf("Handler: Orderbook retrieved for GetOrderAtPrice, contains %d bids and %d asks",
-		len(ob.Bids), len(ob.Asks))
-	// Ищем заявку на нужной цене
+
 	var foundOrder *entity.Order
 	for _, bid := range ob.Bids {
 		if bid.Price == price {
 			foundOrder = &bid
-			log.Printf("Handler: Found bid order at price %.8f with quantity %.4f", price, bid.Quantity)
 			break
 		}
 	}
@@ -551,26 +583,26 @@ func (h *Handler) GetOrderAtPrice(w http.ResponseWriter, r *http.Request) {
 		for _, ask := range ob.Asks {
 			if ask.Price == price {
 				foundOrder = &ask
-				log.Printf("Handler: Found ask order at price %.8f with quantity %.4f", price, ask.Quantity)
 				break
 			}
 		}
 	}
-	response := make(map[string]interface{})
-	response["price"] = price
-	response["market"] = market
-	response["symbol"] = symbol
-	if foundOrder == nil {
-		response["is_present"] = false
-		response["message"] = "no order found at this price"
-		log.Printf("Handler: No order found at price %.8f for symbol %s", price, symbol)
-	} else {
-		response["is_present"] = true
+
+	response := map[string]interface{}{
+		"price":      price,
+		"market":     market,
+		"symbol":     symbol,
+		"is_present": foundOrder != nil,
+	}
+	if foundOrder != nil {
 		response["quantity"] = foundOrder.Quantity
 		response["side"] = foundOrder.Side
-		log.Printf("Handler: Found order at price %.8f: side=%s, quantity=%.4f",
-			price, foundOrder.Side, foundOrder.Quantity)
+		log.Printf("Handler: Found order at price %.8f: side=%s, quantity=%.4f", price, foundOrder.Side, foundOrder.Quantity)
+	} else {
+		response["message"] = "no order found at this price"
+		log.Printf("Handler: No order found at price %.8f for symbol %s", price, symbol)
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Handler: ERROR: Failed to encode response in GetOrderAtPrice: %v", err)
