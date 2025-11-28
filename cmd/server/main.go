@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -34,6 +35,58 @@ import (
 	"sizehunt/pkg/middleware"
 )
 
+func initProxyContainers(proxyService *service.ProxyService, database *sql.DB) {
+	ctx := context.Background()
+	log.Println("Initializing proxy containers for users with active signals...")
+
+	// Получаем всех пользователей с активными сигналами
+	query := `
+		SELECT DISTINCT user_id 
+		FROM signals 
+		WHERE is_active = true`
+	rows, err := database.QueryContext(ctx, query)
+	if err != nil {
+		log.Printf("Failed to get users with active signals: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var userIds []int64
+	for rows.Next() {
+		var userID int64
+		if err := rows.Scan(&userID); err != nil {
+			log.Printf("Error scanning user ID: %v", err)
+			continue
+		}
+		userIds = append(userIds, userID)
+	}
+
+	log.Printf("Found %d users with active signals", len(userIds))
+
+	// Запускаем прокси для каждого пользователя
+	for _, userID := range userIds {
+		go func(uid int64) {
+			// Проверяем, есть ли у пользователя настройки прокси
+			_, err := proxyService.Repo.GetProxyConfig(ctx, uid)
+			if err != nil {
+				log.Printf("User %d has no proxy config, skipping", uid)
+				return
+			}
+
+			// Запускаем прокси контейнер
+			if err := proxyService.StartProxyForUser(ctx, uid); err != nil {
+				log.Printf("Failed to start proxy for user %d: %v", uid, err)
+			} else {
+				log.Printf("Proxy container started successfully for user %d", uid)
+			}
+		}(userID)
+	}
+
+	// Даем время на запуск контейнеров
+	time.Sleep(2 * time.Second)
+	log.Println("Proxy container initialization completed")
+}
+
 func main() {
 	fmt.Println("SizeHunt API starting...")
 	cfg := config.Load()
@@ -55,6 +108,7 @@ func main() {
 	proxyRepo := repository2.NewPostgresProxyRepo(database)
 	proxyService := service.NewProxyService(proxyRepo)
 	proxyHandler := http2.NewProxyHandler(proxyService)
+	initProxyContainers(proxyService, database)
 	// Binance
 	keysRepo := repository.NewPostgresKeysRepo(database)
 	dbx := sqlx.NewDb(database, "postgres") // Конвертируем *sql.DB в *sqlx.DB

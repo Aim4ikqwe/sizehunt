@@ -3,6 +3,7 @@ package service
 
 import (
 	"context"
+	"os"
 
 	"log"
 	"runtime"
@@ -309,13 +310,32 @@ func (w *MarketDepthWatcher) StartConnection() error {
 		}
 	}
 
-	// Создаем клиент с поддержкой прокси
-	var client *WebSocketClient
+	// Если прокси указан, устанавливаем переменные окружения для всех соединений
+	var originalHTTPProxy, originalHTTPSProxy, originalNoProxy string
 	if proxyAddr != "" {
-		client = NewWebSocketClientWithProxy(proxyAddr)
+		log.Printf("MarketDepthWatcher: Setting up SOCKS5 proxy for WebSocket: %s", proxyAddr)
+		originalHTTPProxy = os.Getenv("http_proxy")
+		originalHTTPSProxy = os.Getenv("https_proxy")
+		originalNoProxy = os.Getenv("no_proxy")
+
+		proxyURL := "socks5://" + proxyAddr
+		os.Setenv("http_proxy", proxyURL)
+		os.Setenv("https_proxy", proxyURL)
+		os.Setenv("no_proxy", "")
+
+		// Восстанавливаем исходные настройки после завершения функции
+		defer func() {
+			os.Setenv("http_proxy", originalHTTPProxy)
+			os.Setenv("https_proxy", originalHTTPSProxy)
+			os.Setenv("no_proxy", originalNoProxy)
+			log.Printf("MarketDepthWatcher: Restored original proxy settings")
+		}()
 	} else {
-		client = NewWebSocketClient()
+		log.Printf("MarketDepthWatcher: No proxy configured for user %d", w.UserID)
 	}
+
+	// Создаем обычный клиент (без внутренней настройки прокси)
+	client := NewWebSocketClient()
 
 	client.OnData = func(data *UnifiedDepthStreamData) {
 		w.lastActivityTime = time.Now()
@@ -341,14 +361,17 @@ func (w *MarketDepthWatcher) StartConnection() error {
 	var err error
 	switch w.market {
 	case "spot":
-		log.Printf("MarketDepthWatcher: Connecting to spot combined WebSocket for %d symbols", len(symbols))
+		log.Printf("MarketDepthWatcher: Connecting to spot combined WebSocket for %d symbols with proxy: %v",
+			len(symbols), proxyAddr != "")
 		err = client.ConnectForSpotCombined(w.ctx, symbols)
 	case "futures":
+		// ИСПРАВЛЕНО: правильно определяем symbolLevels здесь
 		symbolLevels := make(map[string]string)
 		for _, symbol := range symbols {
 			symbolLevels[symbol] = "" // "" означает дифф-поток без фиксированного уровня
 		}
-		log.Printf("MarketDepthWatcher: Connecting to futures combined WebSocket for %d symbols", len(symbolLevels))
+		log.Printf("MarketDepthWatcher: Connecting to futures combined WebSocket for %d symbols with proxy: %v",
+			len(symbolLevels), proxyAddr != "")
 		err = client.ConnectForFuturesCombined(w.ctx, symbolLevels)
 	}
 
@@ -357,6 +380,33 @@ func (w *MarketDepthWatcher) StartConnection() error {
 		w.mu.Lock()
 		w.started = false
 		w.mu.Unlock()
+
+		// Дополнительное логирование ошибки для отладки
+		if proxyAddr != "" {
+			log.Printf("MarketDepthWatcher: Attempting to connect without proxy as fallback")
+			// Пытаемся подключиться без прокси для отладки
+			os.Setenv("http_proxy", "")
+			os.Setenv("https_proxy", "")
+			os.Setenv("no_proxy", "")
+
+			var fallbackErr error
+			switch w.market {
+			case "spot":
+				fallbackErr = client.ConnectForSpotCombined(w.ctx, symbols)
+			case "futures":
+				// ИСПРАВЛЕНО: определяем symbolLevels для fallback тоже
+				fallbackSymbolLevels := make(map[string]string)
+				for _, symbol := range symbols {
+					fallbackSymbolLevels[symbol] = ""
+				}
+				fallbackErr = client.ConnectForFuturesCombined(w.ctx, fallbackSymbolLevels)
+			}
+			if fallbackErr != nil {
+				log.Printf("MarketDepthWatcher: Fallback connection also failed: %v", fallbackErr)
+			} else {
+				log.Printf("MarketDepthWatcher: Fallback connection succeeded! Proxy configuration issue detected.")
+			}
+		}
 		return err
 	}
 
@@ -364,12 +414,11 @@ func (w *MarketDepthWatcher) StartConnection() error {
 	w.client = client
 	w.mu.Unlock()
 
-	log.Printf("MarketDepthWatcher: Successfully connected to combined WebSocket for market: %s (took %v)",
-		w.market, time.Since(startTime))
+	log.Printf("MarketDepthWatcher: Successfully connected to combined WebSocket for market: %s (took %v, proxy: %v)",
+		w.market, time.Since(startTime), proxyAddr != "")
 
 	// Запускаем горутину для мониторинга активности
 	go w.monitorActivity()
-
 	return nil
 }
 

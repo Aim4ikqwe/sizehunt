@@ -249,7 +249,7 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 				binanceClient := NewBinanceHTTPClientWithProxy(apiKey, secretKey, proxyAddr, m.cfg)
 				uw.futuresClient = binanceClient.FuturesClient
 				uw.positionWatcher = NewPositionWatcher()
-				uw.userDataStream = NewUserDataStream(uw.futuresClient, uw.positionWatcher)
+				uw.userDataStream = NewUserDataStream(uw.futuresClient, uw.positionWatcher, m.proxyService, userID)
 
 				// Инициализируем позиции для ВСЕХ активных сигналов пользователя
 				go func() {

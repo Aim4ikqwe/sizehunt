@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	proxy_service "sizehunt/internal/proxy/service"
 	"strconv"
 	"sync"
 	"time"
@@ -21,16 +23,20 @@ type UserDataStream struct {
 	mu            sync.Mutex
 	stopWsChan    chan struct{}
 	lastAlive     time.Time
+	proxyService  *proxy_service.ProxyService
+	userID        int64
 	isStopped     bool // Флаг для отслеживания состояния
 }
 
-func NewUserDataStream(client *futures.Client, watcher *PositionWatcher) *UserDataStream {
+func NewUserDataStream(client *futures.Client, watcher *PositionWatcher, proxyService *proxy_service.ProxyService, userID int64) *UserDataStream {
 	return &UserDataStream{
 		futuresClient: client,
 		watcher:       watcher,
 		stopChan:      make(chan struct{}),
 		doneChan:      make(chan struct{}),
 		lastAlive:     time.Now(),
+		proxyService:  proxyService,
+		userID:        userID,
 	}
 }
 
@@ -119,7 +125,6 @@ func (u *UserDataStream) runWs() error {
 			u.watcher.HandleWsEvent(event)
 		}
 	}
-
 	errHandler := func(err error) {
 		log.Printf("UserDataStream: WS ERROR HANDLER: %v", err)
 	}
@@ -132,11 +137,60 @@ func (u *UserDataStream) runWs() error {
 	}
 	u.mu.Unlock()
 
+	// Получаем прокси адрес (если доступен)
+	var proxyAddr string
+	if u.proxyService != nil && u.userID != 0 {
+		if addr, ok := u.proxyService.GetProxyAddressForUser(u.userID); ok {
+			proxyAddr = addr
+		}
+	}
+
+	// Если прокси указан, устанавливаем переменные окружения
+	var originalHTTPProxy, originalHTTPSProxy, originalNoProxy string
+	if proxyAddr != "" {
+		log.Printf("UserDataStream: Setting up SOCKS5 proxy for user data stream: %s", proxyAddr)
+		originalHTTPProxy = os.Getenv("http_proxy")
+		originalHTTPSProxy = os.Getenv("https_proxy")
+		originalNoProxy = os.Getenv("no_proxy")
+
+		proxyURL := "socks5://" + proxyAddr
+		os.Setenv("http_proxy", proxyURL)
+		os.Setenv("https_proxy", proxyURL)
+		os.Setenv("no_proxy", "")
+
+		// Восстанавливаем исходные настройки после завершения функции
+		defer func() {
+			os.Setenv("http_proxy", originalHTTPProxy)
+			os.Setenv("https_proxy", originalHTTPSProxy)
+			os.Setenv("no_proxy", originalNoProxy)
+			log.Printf("UserDataStream: Restored original proxy settings after WS connection")
+		}()
+	}
+
 	// Сохраняем stopC канал для возможности остановки
 	doneC, stopC, err := futures.WsUserDataServe(u.listenKey, handler, errHandler)
 	if err != nil {
-		log.Printf("UserDataStream: ERROR: Failed to start WebSocket: %v", err)
-		return fmt.Errorf("failed to start WebSocket: %w", err)
+		// Дополнительное логирование при ошибке
+		log.Printf("UserDataStream: ERROR: Failed to start WebSocket (proxy: %v): %v", proxyAddr != "", err)
+
+		// Если с прокси не работает, пробуем без прокси для отладки
+		if proxyAddr != "" {
+			log.Printf("UserDataStream: Attempting to connect without proxy as fallback")
+			os.Setenv("http_proxy", "")
+			os.Setenv("https_proxy", "")
+			os.Setenv("no_proxy", "")
+
+			fallbackDoneC, fallbackStopC, fallbackErr := futures.WsUserDataServe(u.listenKey, handler, errHandler)
+			if fallbackErr == nil {
+				log.Printf("UserDataStream: Fallback connection succeeded! Proxy configuration issue detected.")
+				doneC, stopC = fallbackDoneC, fallbackStopC
+			} else {
+				log.Printf("UserDataStream: Fallback connection also failed: %v", fallbackErr)
+				return fmt.Errorf("failed to start WebSocket with or without proxy: %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to start WebSocket: %w", err)
+		}
 	}
 
 	u.mu.Lock()
@@ -165,9 +219,9 @@ func (u *UserDataStream) runWs() error {
 		}
 	}()
 
+	log.Printf("UserDataStream: WebSocket connection established successfully (proxy: %v)", proxyAddr != "")
 	return nil
 }
-
 func (u *UserDataStream) keepAliveLoop() {
 	log.Println("UserDataStream: Keep-alive loop started")
 	defer log.Println("UserDataStream: Keep-alive loop stopped")
