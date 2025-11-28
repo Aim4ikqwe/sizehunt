@@ -255,6 +255,7 @@ func (s *ProxyService) GetProxyAddressForUser(userID int64) (string, bool) {
 }
 
 func (s *ProxyService) StopAllProxies(ctx context.Context) {
+	log.Println("Stopping all proxy containers...")
 	s.mu.Lock()
 	userIDs := make([]int64, 0, len(s.instances))
 	for userID := range s.instances {
@@ -263,10 +264,14 @@ func (s *ProxyService) StopAllProxies(ctx context.Context) {
 	s.mu.Unlock()
 
 	for _, userID := range userIDs {
+		log.Printf("Stopping proxy container for user %d", userID)
 		if err := s.StopProxyForUser(ctx, userID); err != nil {
 			log.Printf("Failed to stop proxy for user %d: %v", userID, err)
+		} else {
+			log.Printf("Successfully stopped proxy for user %d", userID)
 		}
 	}
+	log.Println("All proxy containers stopped")
 }
 
 func (s *ProxyService) DeleteProxyConfig(ctx context.Context, userID int64) error {

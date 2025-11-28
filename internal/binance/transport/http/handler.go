@@ -666,37 +666,38 @@ var server *http.Server
 
 func (h *Handler) GracefulShutdown(w http.ResponseWriter, r *http.Request) {
 	log.Println("Graceful shutdown requested via API endpoint")
-
 	// Отправляем ответ клиенту
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"message": "server is shutting down"})
-
 	// Запускаем shutdown в отдельной горутине
 	go func() {
 		// Небольшая задержка для отправки ответа
 		time.Sleep(100 * time.Millisecond)
-
 		log.Println("Starting graceful shutdown process")
+
+		// Останавливаем все прокси-контейнеры
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		log.Println("Stopping all proxy containers")
+		if h.ProxyService != nil {
+			h.ProxyService.StopAllProxies(ctx)
+		}
 
 		// Получаем список всех пользователей из WebSocketManager
 		userIDs := h.WebSocketManager.GetAllUserIDs()
-
 		for _, userID := range userIDs {
 			log.Printf("Cleaning up resources for user %d", userID)
 			h.WebSocketManager.CleanupUserResources(userID)
 		}
-
 		log.Println("All user resources cleaned up")
 
 		// Создаем контекст с таймаутом для graceful shutdown
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-
 		log.Println("Initiating server shutdown")
 		if err := h.Server.Shutdown(ctx); err != nil {
 			log.Printf("Server shutdown failed: %v", err)
 		}
-
 		// Выходим из приложения после успешного завершения
 		os.Exit(0)
 	}()

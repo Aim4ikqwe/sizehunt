@@ -241,26 +241,30 @@ func main() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
-
 		log.Println("Shutdown signal received, starting graceful shutdown")
-		shutdownServer(server)
+		shutdownServer(server, proxyService) // Передаем proxyService
 	}()
-
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 }
 
-func shutdownServer(server *http.Server) {
+func shutdownServer(server *http.Server, proxyService *service.ProxyService) {
 	log.Println("Starting server shutdown process")
 
-	// Создаем контекст с таймаутом
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Сначала останавливаем все прокси
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if proxyService != nil {
+		log.Println("Stopping all proxy containers")
+		proxyService.StopAllProxies(ctx)
+	}
 
+	// Затем останавливаем HTTP-сервер
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("Server shutdown failed: %v", err)
 	}
-
 	log.Println("Server stopped")
 }
