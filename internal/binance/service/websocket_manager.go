@@ -4,7 +4,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"github.com/adshao/go-binance/v2/futures"
 	"log"
 	"net/http"
 	"sizehunt/internal/binance/repository"
@@ -14,6 +13,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/adshao/go-binance/v2/futures"
 )
 
 // UserWatcher хранит watcher'ы по символам для одного пользователя
@@ -235,11 +236,18 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 				log.Printf("WebSocketManager: ERROR: Failed to get valid API keys for user %d", userID)
 				return nil, fmt.Errorf("futures auto-close requires valid API keys")
 			}
+			proxyAddr := ""
+			if addr, ok := m.GetProxyAddressForUser(userID); ok {
+				proxyAddr = addr
+				log.Printf("WebSocketManager: Using proxy %s for user %d futures client", proxyAddr, userID)
+			}
 
-			// Создаем или используем существующие ресурсы
+			// Создаем или используем существующие ресурсы + proxy
 			if uw.futuresClient == nil {
 				log.Printf("WebSocketManager: Creating new futures client for user %d", userID)
-				uw.futuresClient = futures.NewClient(apiKey, secretKey)
+				// Создаем Binance HTTP клиент с прокси
+				binanceClient := NewBinanceHTTPClientWithProxy(apiKey, secretKey, proxyAddr, m.cfg)
+				uw.futuresClient = binanceClient.FuturesClient
 				uw.positionWatcher = NewPositionWatcher()
 				uw.userDataStream = NewUserDataStream(uw.futuresClient, uw.positionWatcher)
 
