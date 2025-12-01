@@ -554,6 +554,21 @@ func (m *WebSocketManager) DeleteUserSignal(userID int64, signalID int64) error 
 			log.Printf("WebSocketManager: Removing signal %d from watcher", signalID)
 			watcher.RemoveSignal(signalID)
 		}
+		// Проверяем наличие активных сигналов после удаления
+		activeSignals, err := m.signalRepo.GetActiveByUserID(context.Background(), userID)
+		if err != nil {
+			log.Printf("WebSocketManager: ERROR: Failed to get active signals for user %d: %v", userID, err)
+		} else if len(activeSignals) == 0 {
+			// Если активных сигналов нет, останавливаем прокси контейнер
+			log.Printf("WebSocketManager: No active signals left for user %d, stopping proxy container", userID)
+			if m.proxyService != nil {
+				if err := m.proxyService.StopProxyForUser(context.Background(), userID); err != nil {
+					log.Printf("WebSocketManager: ERROR: Failed to stop proxy for user %d: %v", userID, err)
+				} else {
+					log.Printf("WebSocketManager: Proxy container stopped successfully for user %d", userID)
+				}
+			}
+		}
 	}()
 
 	// Удаляем сигнал из базы данных асинхронно

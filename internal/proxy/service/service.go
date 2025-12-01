@@ -8,14 +8,14 @@ import (
 	"sync"
 	"time"
 
+	"sizehunt/internal/proxy"
+	"sizehunt/internal/proxy/repository"
+
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 	"github.com/pkg/errors"
-
-	"sizehunt/internal/proxy"
-	"sizehunt/internal/proxy/repository"
 )
 
 type ProxyService struct {
@@ -31,21 +31,37 @@ func NewProxyService(repo repository.ProxyRepository) *ProxyService {
 	if err != nil {
 		log.Fatalf("Failed to create Docker client: %v", err)
 	}
-
 	return &ProxyService{
 		Repo:      repo,
 		instances: make(map[int64]*proxy.ProxyInstance),
 		dockerCli: cli,
 	}
 }
+
 func (s *ProxyService) ConfigureProxy(ctx context.Context, userID int64, ssAddr string, ssPort int, ssMethod, ssPassword string) error {
-	// Сохраняем конфиг с портом
-	_, err := s.Repo.SaveProxyConfig(ctx, userID, ssAddr, ssPort, ssMethod, ssPassword)
+	// Сохраняем/обновляем конфиг с портом
+	localPort, err := s.Repo.SaveProxyConfig(ctx, userID, ssAddr, ssPort, ssMethod, ssPassword)
 	if err != nil {
 		return errors.Wrap(err, "failed to save proxy config")
 	}
-	// Запускаем прокси
-	return s.StartProxyForUser(ctx, userID)
+	log.Printf("Proxy config saved for user %d with local port %d", userID, localPort)
+
+	// Если у пользователя есть активные сигналы, запускаем прокси
+	hasActiveSignals, err := s.hasActiveSignalsForUser(ctx, userID)
+	if err != nil {
+		log.Printf("Failed to check active signals for user %d: %v", userID, err)
+	} else if hasActiveSignals {
+		// Запускаем прокси
+		return s.StartProxyForUser(ctx, userID)
+	}
+
+	return nil
+}
+
+func (s *ProxyService) hasActiveSignalsForUser(ctx context.Context, userID int64) (bool, error) {
+	// Этот метод нужно будет реализовать в другом месте, пока заглушка
+	// В реальном приложении здесь будет запрос к базе данных
+	return true, nil
 }
 
 func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) error {
@@ -53,17 +69,43 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 	if err != nil {
 		return errors.Wrap(err, "failed to get proxy config")
 	}
+
+	// Определяем имя контейнера в самом начале
+	containerName := fmt.Sprintf("ss-proxy-%d", userID)
+
+	// Проверяем текущий статус прокси
 	if config.Status == "running" {
-		return nil // уже запущен
+		// Проверяем, существует ли контейнер и запущен ли он
+		_, err := s.dockerCli.ContainerInspect(ctx, containerName)
+		if err == nil {
+			containerJSON, err := s.dockerCli.ContainerInspect(ctx, containerName)
+			if err == nil && containerJSON.State.Running {
+				log.Printf("Proxy container already running for user %d", userID)
+				s.mu.Lock()
+				s.instances[userID] = &proxy.ProxyInstance{
+					Config:      config,
+					ContainerID: containerName,
+					Status:      "running",
+				}
+				s.mu.Unlock()
+				return nil // Контейнер уже запущен
+			}
+		}
+		// Если контейнер не существует или не запущен, но статус в БД "running",
+		// обновляем статус на "stopped" перед запуском нового контейнера
+		if err := s.Repo.UpdateStatus(ctx, config.ID, "stopped"); err != nil {
+			log.Printf("Failed to update proxy status for user %d: %v", userID, err)
+		}
 	}
 
-	// Проверяем, существует ли уже контейнер для этого пользователя
-	containerName := fmt.Sprintf("ss-proxy-%d", userID)
+	// Проверяем, существует ли уже контейнер для этого пользователя и удаляем его при необходимости
 	_, err = s.dockerCli.ContainerInspect(ctx, containerName)
 	if err == nil {
+		log.Printf("Stopping existing container %s for user %d", containerName, userID)
 		if err := s.dockerCli.ContainerStop(ctx, containerName, container.StopOptions{}); err != nil {
 			log.Printf("Failed to stop existing container: %v", err)
 		}
+		log.Printf("Removing existing container %s for user %d", containerName, userID)
 		if err := s.dockerCli.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true}); err != nil {
 			log.Printf("Failed to remove existing container: %v", err)
 		}
@@ -89,7 +131,7 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 			"-m", config.SSMethod,
 			"-k", config.SSPassword,
 			"-b", "0.0.0.0",
-			"-l", fmt.Sprintf("%d", 1080),
+			"-l", "1080", // Всегда 1080 внутри контейнера
 			"-u",
 			"--fast-open",
 		},
@@ -130,8 +172,11 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 				buf := new(strings.Builder)
 				_, err = stdcopy.StdCopy(buf, buf, logs)
 				if err == nil {
-					if strings.Contains(strings.ToLower(buf.String()), "error") || strings.Contains(strings.ToLower(buf.String()), "fail") {
-						log.Printf("Container logs for %s: %s", containerName, buf.String())
+					logOutput := buf.String()
+					if strings.Contains(strings.ToLower(logOutput), "error") ||
+						strings.Contains(strings.ToLower(logOutput), "fail") ||
+						strings.Contains(strings.ToLower(logOutput), "invalid") {
+						log.Printf("Container logs for %s: %s", containerName, logOutput)
 						s.dockerCli.ContainerStop(ctx, containerName, container.StopOptions{})
 						s.Repo.UpdateStatus(ctx, config.ID, "error")
 						return fmt.Errorf("container started with errors")
@@ -154,6 +199,7 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 	s.mu.Unlock()
 
 	s.Repo.UpdateStatus(ctx, config.ID, "running")
+	log.Printf("Proxy container started successfully for user %d on port %d", userID, config.LocalPort)
 
 	// Запускаем горутину для мониторинга состояния контейнера
 	go s.monitorContainer(ctx, userID, containerName)
@@ -162,6 +208,7 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 }
 
 func (s *ProxyService) monitorContainer(ctx context.Context, userID int64, containerName string) {
+	log.Printf("Starting monitor for container %s (user %d)", containerName, userID)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -171,32 +218,33 @@ func (s *ProxyService) monitorContainer(ctx context.Context, userID int64, conta
 			containerJSON, err := s.dockerCli.ContainerInspect(ctx, containerName)
 			if err != nil {
 				// Контейнер не существует, возможно, был удален
+				log.Printf("Container %s for user %d does not exist anymore", containerName, userID)
 				s.mu.Lock()
 				delete(s.instances, userID)
 				s.mu.Unlock()
-				if instance, ok := s.instances[userID]; ok {
+				if instance, ok := s.instances[userID]; ok && instance.Config != nil {
 					s.Repo.UpdateStatus(ctx, instance.Config.ID, "stopped")
 				}
 				return
 			}
-
 			if !containerJSON.State.Running {
 				// Контейнер упал, пытаемся перезапустить
 				log.Printf("Container %s for user %d is not running, attempting restart", containerName, userID)
 				if err := s.dockerCli.ContainerStart(ctx, containerName, container.StartOptions{}); err != nil {
 					log.Printf("Failed to restart container %s: %v", containerName, err)
-
 					s.mu.Lock()
 					delete(s.instances, userID)
 					s.mu.Unlock()
-
-					if instance, ok := s.instances[userID]; ok {
+					if instance, ok := s.instances[userID]; ok && instance.Config != nil {
 						s.Repo.UpdateStatus(ctx, instance.Config.ID, "error")
 					}
 					return
+				} else {
+					log.Printf("Container %s for user %d successfully restarted", containerName, userID)
 				}
 			}
 		case <-ctx.Done():
+			log.Printf("Stopping monitor for container %s (user %d)", containerName, userID)
 			return
 		}
 	}
@@ -205,51 +253,61 @@ func (s *ProxyService) monitorContainer(ctx context.Context, userID int64, conta
 func (s *ProxyService) StopProxyForUser(ctx context.Context, userID int64) error {
 	s.mu.Lock()
 	instance, exists := s.instances[userID]
-	s.mu.Unlock()
-
 	if !exists || instance == nil {
+		s.mu.Unlock()
 		return nil
 	}
+	containerID := instance.ContainerID
+	config := instance.Config
+	s.mu.Unlock()
 
-	if instance.ContainerID != "" {
-		// Останавливаем контейнер
-		if err := s.dockerCli.ContainerStop(ctx, instance.ContainerID, container.StopOptions{}); err != nil {
+	if containerID != "" {
+		log.Printf("Stopping proxy container %s for user %d", containerID, userID)
+		// Сначала пробуем остановить контейнер
+		stopCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if err := s.dockerCli.ContainerStop(stopCtx, containerID, container.StopOptions{}); err != nil {
 			// Если не удалось остановить, пытаемся удалить принудительно
-			if err := s.dockerCli.ContainerRemove(ctx, instance.ContainerID, container.RemoveOptions{
+			log.Printf("Failed to stop container %s: %v, attempting force removal", containerID, err)
+			if err := s.dockerCli.ContainerRemove(ctx, containerID, container.RemoveOptions{
 				Force: true,
 			}); err != nil {
-				log.Printf("Failed to remove container %s: %v", instance.ContainerID, err)
+				log.Printf("Failed to remove container %s: %v", containerID, err)
 			}
+		} else {
+			log.Printf("Container %s stopped successfully", containerID)
 		}
 	}
 
-	if instance.Config != nil {
-		s.Repo.UpdateStatus(ctx, instance.Config.ID, "stopped")
+	if config != nil {
+		log.Printf("Updating proxy status to 'stopped' for user %d", userID)
+		if err := s.Repo.UpdateStatus(ctx, config.ID, "stopped"); err != nil {
+			log.Printf("Failed to update proxy status for user %d: %v", userID, err)
+		}
 	}
 
 	s.mu.Lock()
 	delete(s.instances, userID)
 	s.mu.Unlock()
 
+	log.Printf("Proxy container stopped for user %d", userID)
 	return nil
 }
 
 func (s *ProxyService) GetProxyAddressForUser(userID int64) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	instance, exists := s.instances[userID]
 	if !exists || instance == nil || instance.Status != "running" {
 		return "", false
 	}
-
 	// Проверяем, что контейнер действительно запущен
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 	containerJSON, err := s.dockerCli.ContainerInspect(ctx, instance.ContainerID)
 	if err != nil || !containerJSON.State.Running {
 		return "", false
 	}
-
 	return fmt.Sprintf("127.0.0.1:%d", instance.Config.LocalPort), true
 }
 
@@ -261,7 +319,6 @@ func (s *ProxyService) StopAllProxies(ctx context.Context) {
 		userIDs = append(userIDs, userID)
 	}
 	s.mu.Unlock()
-
 	for _, userID := range userIDs {
 		log.Printf("Stopping proxy container for user %d", userID)
 		if err := s.StopProxyForUser(ctx, userID); err != nil {
@@ -274,15 +331,27 @@ func (s *ProxyService) StopAllProxies(ctx context.Context) {
 }
 
 func (s *ProxyService) DeleteProxyConfig(ctx context.Context, userID int64) error {
+	log.Printf("Deleting proxy config for user %d", userID)
 	// Сначала останавливаем прокси
 	if err := s.StopProxyForUser(ctx, userID); err != nil {
-		return errors.Wrap(err, "failed to stop proxy")
+		log.Printf("Failed to stop proxy for user %d during deletion: %v", userID, err)
+		// Не возвращаем ошибку, продолжаем удаление конфигурации
 	}
-
 	// Удаляем конфиг из БД
 	if err := s.Repo.DeleteProxyConfig(ctx, userID); err != nil {
 		return errors.Wrap(err, "failed to delete proxy config from database")
 	}
-
+	log.Printf("Proxy config successfully deleted for user %d", userID)
 	return nil
+}
+
+// IsProxyRunningForUser проверяет, запущен ли прокси для пользователя
+func (s *ProxyService) IsProxyRunningForUser(userID int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	instance, exists := s.instances[userID]
+	if !exists || instance == nil {
+		return false
+	}
+	return instance.Status == "running"
 }

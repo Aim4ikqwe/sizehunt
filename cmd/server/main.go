@@ -14,6 +14,7 @@ import (
 	repository2 "sizehunt/internal/proxy/repository"
 	"sizehunt/internal/proxy/service"
 	http2 "sizehunt/internal/proxy/transport/http"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,7 +37,7 @@ import (
 	"sizehunt/pkg/middleware"
 )
 
-func initProxyContainers(proxyService *service.ProxyService, database *sql.DB) {
+func initProxyContainers(proxyService *service.ProxyService, database *sql.DB, signalRepo repository.SignalRepository) {
 	ctx := context.Background()
 	log.Println("Initializing proxy containers for users with active signals...")
 
@@ -61,12 +62,15 @@ func initProxyContainers(proxyService *service.ProxyService, database *sql.DB) {
 		}
 		userIds = append(userIds, userID)
 	}
-
 	log.Printf("Found %d users with active signals", len(userIds))
 
-	// Запускаем прокси для каждого пользователя
+	// Запускаем прокси для каждого пользователя синхронно
+	var wg sync.WaitGroup
 	for _, userID := range userIds {
+		wg.Add(1)
 		go func(uid int64) {
+			defer wg.Done()
+
 			// Проверяем, есть ли у пользователя настройки прокси
 			_, err := proxyService.Repo.GetProxyConfig(ctx, uid)
 			if err != nil {
@@ -82,9 +86,8 @@ func initProxyContainers(proxyService *service.ProxyService, database *sql.DB) {
 			}
 		}(userID)
 	}
+	wg.Wait()
 
-	// Даем время на запуск контейнеров
-	time.Sleep(2 * time.Second)
 	log.Println("Proxy container initialization completed")
 }
 
@@ -108,12 +111,13 @@ func main() {
 	// Proxy
 	proxyRepo := repository2.NewPostgresProxyRepo(database)
 	proxyService := service.NewProxyService(proxyRepo)
-	proxyHandler := http2.NewProxyHandler(proxyService)
-	initProxyContainers(proxyService, database)
+	proxyHandler := http2.NewProxyHandler(proxyService, proxyRepo)
 	// Binance
 	keysRepo := repository.NewPostgresKeysRepo(database)
 	dbx := sqlx.NewDb(database, "postgres") // Конвертируем *sql.DB в *sqlx.DB
 	signalRepo := repository.NewPostgresSignalRepo(dbx)
+
+	initProxyContainers(proxyService, database, signalRepo)
 	binanceClient := binance_service.NewBinanceHTTPClient("", "") // Инициализируем без ключей
 	binanceWatcher := binance_service.NewWatcher(binanceClient)
 	subRepo := subscriptionrepository.NewSubscriptionRepository(database)

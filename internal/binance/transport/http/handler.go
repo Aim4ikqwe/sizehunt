@@ -335,8 +335,9 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Handler: Position for %s is %.6f, allowing auto-close signal (check took %v)",
 			req.Symbol, positionAmt, positionCheckDuration)
 	}
+	// 7. Проверка и запуск прокси если необходимо
 
-	// 7. Получение ордербука (сетевая операция, но необходима)
+	// 7.1. Получение ордербука (сетевая операция, но необходима)
 	if _, hasProxy := h.ProxyService.GetProxyAddressForUser(userID); !hasProxy {
 		log.Printf("Handler: ERROR: Proxy not configured for user %d. Required to create signal.", userID)
 		http.Error(w, "proxy configuration is required", http.StatusForbidden)
@@ -395,7 +396,18 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	}
 	saveDuration := time.Since(saveStartTime)
 	log.Printf("Handler: Signal saved to database with ID %d (took %v)", signalDB.ID, saveDuration)
-
+	// Проверяем, запущен ли прокси для пользователя
+	_, hasProxy := h.ProxyService.GetProxyAddressForUser(userID)
+	if !hasProxy {
+		// Если прокси не запущен, пытаемся его запустить
+		log.Printf("Handler: Proxy not running for user %d, attempting to start", userID)
+		if err := h.ProxyService.StartProxyForUser(r.Context(), userID); err != nil {
+			log.Printf("Handler: WARNING: Failed to start proxy for user %d: %v", userID, err)
+			// Не возвращаем ошибку, так как сигнал уже сохранен в базе
+		} else {
+			log.Printf("Handler: Proxy container started successfully for user %d", userID)
+		}
+	}
 	// 11. Получение watcher'а с минимальным временем удержания блокировки
 	log.Printf("Handler: Getting or creating watcher for user %d, symbol %s, market %s, autoClose %v",
 		userID, req.Symbol, req.Market, req.AutoClose)
