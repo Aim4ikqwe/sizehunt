@@ -17,7 +17,8 @@ func NewProxyHandler(proxyService *service.ProxyService) *ProxyHandler {
 
 type ProxyConfigRequest struct {
 	SSAddr     string `json:"ss_addr"`
-	SSMethod   string `json:"ss_method"`
+	SSPort     int    `json:"ss_port"` // ДОБАВЛЕНО ПОЛЕ ПОРТА
+	SSMethod   string `json:"encryption_method" validate:"required,oneof=aes-256-gcm chacha20-ietf-poly1305 aes-128-gcm"`
 	SSPassword string `json:"ss_password"`
 }
 
@@ -32,7 +33,8 @@ func (h *ProxyHandler) SaveProxyConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "all fields are required", http.StatusBadRequest)
 		return
 	}
-	err := h.ProxyService.ConfigureProxy(r.Context(), userID, req.SSAddr, req.SSMethod, req.SSPassword)
+	// ДОБАВЛЕНА ПЕРЕДАЧА ПОРТА В ConfigureProxy
+	err := h.ProxyService.ConfigureProxy(r.Context(), userID, req.SSAddr, req.SSPort, req.SSMethod, req.SSPassword)
 	if err != nil {
 		http.Error(w, "failed to configure proxy: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -42,7 +44,6 @@ func (h *ProxyHandler) SaveProxyConfig(w http.ResponseWriter, r *http.Request) {
 		"message": "Proxy configured successfully",
 	})
 }
-
 func (h *ProxyHandler) DeleteProxyConfig(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value(middleware.UserIDKey).(int64)
 	// Останавливаем прокси

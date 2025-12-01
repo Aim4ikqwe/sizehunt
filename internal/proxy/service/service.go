@@ -38,10 +38,9 @@ func NewProxyService(repo repository.ProxyRepository) *ProxyService {
 		dockerCli: cli,
 	}
 }
-
-func (s *ProxyService) ConfigureProxy(ctx context.Context, userID int64, ssAddr, ssMethod, ssPassword string) error {
-	// Сохраняем конфиг
-	_, err := s.Repo.SaveProxyConfig(ctx, userID, ssAddr, ssMethod, ssPassword)
+func (s *ProxyService) ConfigureProxy(ctx context.Context, userID int64, ssAddr string, ssPort int, ssMethod, ssPassword string) error {
+	// Сохраняем конфиг с портом
+	_, err := s.Repo.SaveProxyConfig(ctx, userID, ssAddr, ssPort, ssMethod, ssPassword)
 	if err != nil {
 		return errors.Wrap(err, "failed to save proxy config")
 	}
@@ -86,7 +85,7 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 		Cmd: []string{
 			"ss-local",
 			"-s", config.SSAddr,
-			"-p", "8388",
+			"-p", fmt.Sprintf("%d", config.SSPort),
 			"-m", config.SSMethod,
 			"-k", config.SSPassword,
 			"-b", "0.0.0.0",
