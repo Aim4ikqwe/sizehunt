@@ -969,4 +969,19 @@ func (m *WebSocketManager) GracefulStopProxyForUser(userID int64) {
 			log.Printf("WebSocketManager: Proxy container stopped successfully for user %d", userID)
 		}
 	}
+	// 5. ДОПОЛНИТЕЛЬНЫЙ ШАГ: Останавливаем UserDataStream
+	m.mu.RLock()
+	uw, exists := m.userWatchers[userID]
+	m.mu.RUnlock()
+
+	if exists && uw != nil && uw.userDataStream != nil {
+		log.Printf("WebSocketManager: Stopping UserDataStream for user %d after proxy shutdown", userID)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		uw.userDataStream.StopWithContext(ctx)
+		log.Printf("WebSocketManager: UserDataStream stopped for user %d", userID)
+
+		// 6. Очищаем ресурсы пользователя полностью
+		go m.CleanupUserResources(userID)
+	}
 }
