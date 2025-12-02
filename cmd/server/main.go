@@ -147,12 +147,6 @@ func main() {
 	// Передаем сервер в обработчик Binance
 	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager, subService, server, signalRepo, proxyService)
 	subHandler := subscriptionhttp.NewSubscriptionHandler(subService)
-	log.Println("Loading active signals from database...")
-	if err := wsManager.LoadActiveSignals(); err != nil {
-		log.Printf("Failed to load active signals: %v", err)
-	} else {
-		log.Println("Active signals loaded successfully")
-	}
 	// --- РОУТЕР ---
 	r := chi.NewRouter()
 
