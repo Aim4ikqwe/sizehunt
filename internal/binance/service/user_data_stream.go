@@ -321,11 +321,37 @@ func (u *UserDataStream) StopWithContext(ctx context.Context) {
 	u.isStopped = true
 	u.mu.Unlock()
 
-	// Создаем контекст с отменой для внутренних операций
-	stopCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
+	// Сначала удаляем listen key через работающий прокси
+	u.mu.Lock()
+	listenKey := u.listenKey
+	u.listenKey = ""
+	u.mu.Unlock()
 
-	// Останавливаем keep-alive и другие горутины
+	if listenKey != "" {
+		log.Printf("UserDataStream: Deleting listen key: %s", listenKey)
+		// Используем контекст с большим таймаутом для удаления ключа
+		delCtx, delCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer delCancel()
+
+		startDelTime := time.Now()
+		err := u.futuresClient.NewCloseUserStreamService().ListenKey(listenKey).Do(delCtx)
+		if err != nil {
+			log.Printf("UserDataStream: WARNING: Failed to delete listen key: %v (attempted via %s proxy)",
+				err, func() string {
+					if u.proxyService != nil {
+						if addr, ok := u.proxyService.GetProxyAddressForUser(u.userID); ok {
+							return addr
+						}
+					}
+					return "direct connection"
+				}())
+		} else {
+			log.Printf("UserDataStream: Listen key %s deleted successfully (took %v)",
+				listenKey, time.Since(startDelTime))
+		}
+	}
+
+	// Останавливаем keep-alive loop
 	u.mu.Lock()
 	if u.stopChan != nil {
 		close(u.stopChan)
@@ -334,7 +360,7 @@ func (u *UserDataStream) StopWithContext(ctx context.Context) {
 	}
 	u.mu.Unlock()
 
-	// Закрываем WebSocket соединение
+	// Останавливаем WebSocket соединение
 	u.mu.Lock()
 	if u.stopWsChan != nil {
 		close(u.stopWsChan)
@@ -343,60 +369,22 @@ func (u *UserDataStream) StopWithContext(ctx context.Context) {
 	}
 	u.mu.Unlock()
 
-	// Удаляем listen key с таймаутом
-	u.mu.Lock()
-	if u.listenKey != "" {
-		log.Printf("UserDataStream: Deleting listen key: %s", u.listenKey)
-		listenKey := u.listenKey // сохраняем локальную копию
-		u.listenKey = ""
-		u.mu.Unlock()
-
-		delCtx, delCancel := context.WithTimeout(stopCtx, 2*time.Second)
-		defer delCancel()
-
-		err := u.futuresClient.NewCloseUserStreamService().ListenKey(listenKey).Do(delCtx)
-		if err != nil {
-			log.Printf("UserDataStream: WARNING: Failed to delete listen key: %v", err)
-		} else {
-			log.Printf("UserDataStream: Listen key %s deleted successfully", listenKey)
-		}
-	} else {
-		u.mu.Unlock()
-	}
-
-	// Ждем завершения в отдельной горутине с таймаутом
+	// Ждем завершения фоновых процессов с разумным таймаутом
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		u.mu.Lock()
-		doneChan := u.doneChan
-		u.mu.Unlock()
-
-		if doneChan != nil {
-			select {
-			case <-doneChan:
-				log.Println("UserDataStream: All background processes stopped")
-			case <-time.After(3 * time.Second):
-				log.Println("UserDataStream: WARNING: Background processes may still be running after timeout")
-			}
-		} else {
-			log.Println("UserDataStream: No background processes to wait for")
+		// Ждем максимум 3 секунды для завершения всех операций
+		select {
+		case <-time.After(3 * time.Second):
+			log.Println("UserDataStream: Background processes termination timeout reached")
 		}
 	}()
 
 	select {
 	case <-done:
-		log.Println("UserDataStream: Stop completed successfully")
-	case <-stopCtx.Done():
-		log.Println("UserDataStream: Stop completed with context timeout")
+	case <-ctx.Done():
 	}
 
-	// Дополнительная очистка - устанавливаем все каналы в nil
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.stopChan = nil
-	u.stopWsChan = nil
-	u.doneChan = nil
 	log.Println("UserDataStream: All resources cleaned up after stop")
 }
 func (u *UserDataStream) initializePositionForSymbol(symbol string) error {

@@ -929,7 +929,7 @@ func (m *WebSocketManager) GetProxyAddressForUser(userID int64) (string, bool) {
 func (m *WebSocketManager) GracefulStopProxyForUser(userID int64) {
 	log.Printf("WebSocketManager: Starting graceful stop for proxy of user %d", userID)
 
-	// 1. Проверяем, есть ли активные сигналы в базе данных
+	// 1. Сначала проверяем наличие активных сигналов
 	activeSignals, err := m.signalRepo.GetActiveByUserID(context.Background(), userID)
 	if err != nil {
 		log.Printf("WebSocketManager: ERROR: Failed to get active signals for user %d: %v", userID, err)
@@ -941,24 +941,40 @@ func (m *WebSocketManager) GracefulStopProxyForUser(userID int64) {
 		return
 	}
 
-	// 2. Проверяем, есть ли операции закрытия позиций в процессе
-	// (Пока нет точного способа отследить это, делаем паузу для завершения всех операций)
-	log.Printf("WebSocketManager: Waiting for position closing operations to complete for user %d...", userID)
-	time.Sleep(3 * time.Second) // Даем время на завершение всех операций с позициями
+	// 2. Проверяем наличие UserDataStream и останавливаем его СНАЧАЛА
+	m.mu.RLock()
+	uw, exists := m.userWatchers[userID]
+	m.mu.RUnlock()
 
-	// 3. Проверяем еще раз наличие активных сигналов после паузы
-	activeSignals, err = m.signalRepo.GetActiveByUserID(context.Background(), userID)
-	if err != nil {
-		log.Printf("WebSocketManager: ERROR: Failed to re-check active signals for user %d: %v", userID, err)
-		return
+	if exists && uw != nil && uw.userDataStream != nil {
+		log.Printf("WebSocketManager: Stopping UserDataStream for user %d before proxy shutdown", userID)
+		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		// Принудительно обновляем позиции перед остановкой
+		if uw.positionWatcher != nil {
+			log.Printf("WebSocketManager: Force refreshing positions before UserDataStream stop")
+			for symbol := range uw.futuresWatchers {
+				if err := uw.userDataStream.initializePositionForSymbol(symbol); err != nil {
+					log.Printf("WebSocketManager: WARNING: Failed to refresh position for %s: %v", symbol, err)
+				}
+			}
+		}
+
+		// Останавливаем UserDataStream с большим таймаутом
+		uw.userDataStream.StopWithContext(stopCtx)
+		log.Printf("WebSocketManager: UserDataStream stopped for user %d", userID)
+
+		// Очищаем ресурсы пользователя
+		uw.userDataStream = nil
+		uw.futuresClient = nil
+		uw.positionWatcher = nil
 	}
 
-	if len(activeSignals) > 0 {
-		log.Printf("WebSocketManager: User %d has %d active signals after wait, skipping proxy stop", userID, len(activeSignals))
-		return
-	}
+	// 3. Ждем немного для завершения всех сетевых операций
+	time.Sleep(1 * time.Second)
 
-	// 4. Останавливаем прокси
+	// 4. Только после этого останавливаем прокси
 	if m.proxyService != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -969,19 +985,31 @@ func (m *WebSocketManager) GracefulStopProxyForUser(userID int64) {
 			log.Printf("WebSocketManager: Proxy container stopped successfully for user %d", userID)
 		}
 	}
-	// 5. ДОПОЛНИТЕЛЬНЫЙ ШАГ: Останавливаем UserDataStream
+
+	// 5. Дополнительно проверяем и очищаем ресурсы
+	go func() {
+		time.Sleep(2 * time.Second)
+		m.CleanupUserResources(userID)
+	}()
+}
+func (m *WebSocketManager) StopUserDataStreamForUser(ctx context.Context, userID int64) error {
 	m.mu.RLock()
 	uw, exists := m.userWatchers[userID]
 	m.mu.RUnlock()
 
-	if exists && uw != nil && uw.userDataStream != nil {
-		log.Printf("WebSocketManager: Stopping UserDataStream for user %d after proxy shutdown", userID)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		uw.userDataStream.StopWithContext(ctx)
-		log.Printf("WebSocketManager: UserDataStream stopped for user %d", userID)
-
-		// 6. Очищаем ресурсы пользователя полностью
-		go m.CleanupUserResources(userID)
+	if !exists || uw == nil || uw.userDataStream == nil {
+		return nil
 	}
+
+	log.Printf("WebSocketManager: Stopping UserDataStream for user %d", userID)
+	uw.userDataStream.StopWithContext(ctx)
+
+	// Очищаем ресурсы
+	uw.mu.Lock()
+	uw.userDataStream = nil
+	uw.futuresClient = nil
+	uw.positionWatcher = nil
+	uw.mu.Unlock()
+
+	return nil
 }

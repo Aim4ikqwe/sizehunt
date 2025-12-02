@@ -241,36 +241,49 @@ func main() {
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
 		log.Println("Shutdown signal received, starting graceful shutdown")
-		shutdownServer(server, proxyService) // Передаем proxyService
+		shutdownServer(server, proxyService, wsManager) // Добавлен третий параметр wsManager
 	}()
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 }
 
-func shutdownServer(server *http.Server, proxyService *service.ProxyService) {
+func shutdownServer(server *http.Server, proxyService *service.ProxyService, wsManager *binance_service.WebSocketManager) {
 	log.Println("Starting server shutdown process")
 
-	// 1. Сначала останавливаем WebSocketManager для завершения всех операций
-	// (Это нужно добавить в WebSocketManager как метод GracefulShutdown)
-
-	// 2. Даем время на завершение всех операций с позициями - 10 секунд
-	log.Println("Waiting for position closing operations to complete...")
-	time.Sleep(10 * time.Second)
-
-	// 3. Только потом останавливаем прокси
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// 1. Сначала останавливаем все UserDataStream'ы для всех пользователей
+	log.Println("Stopping all UserDataStreams for users...")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// Получаем всех пользователей из WebSocketManager
+	userIDs := wsManager.GetAllUserIDs()
+
+	for _, userID := range userIDs {
+		log.Printf("Stopping UserDataStream for user %d", userID)
+		if err := wsManager.StopUserDataStreamForUser(ctx, userID); err != nil {
+			log.Printf("WARNING: Failed to stop UserDataStream for user %d: %v", userID, err)
+		}
+	}
+
+	// 2. Ждем завершения всех операций с позициями
+	log.Println("Waiting for position closing operations to complete...")
+	time.Sleep(5 * time.Second)
+
+	// 3. Останавливаем все прокси-контейнеры
 	if proxyService != nil {
 		log.Println("Stopping all proxy containers")
-		proxyService.StopAllProxies(ctx)
+		proxyCtx, proxyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer proxyCancel()
+		proxyService.StopAllProxies(proxyCtx)
 	}
 
-	// 4. Затем останавливаем HTTP-сервер
-	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
+	// 4. Завершаем HTTP сервер
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Server shutdown failed: %v", err)
 	}
+
 	log.Println("Server stopped")
 }
