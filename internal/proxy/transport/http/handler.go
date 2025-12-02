@@ -66,11 +66,10 @@ func (h *ProxyHandler) DeleteProxyConfig(w http.ResponseWriter, r *http.Request)
 	userID := r.Context().Value(middleware.UserIDKey).(int64)
 	log.Printf("Deleting proxy config for user %d", userID)
 
-	// Останавливаем прокси
+	// Сначала останавливаем прокси
 	if err := h.ProxyService.StopProxyForUser(r.Context(), userID); err != nil {
 		log.Printf("Failed to stop proxy for user %d: %v", userID, err)
-		http.Error(w, "failed to stop proxy: "+err.Error(), http.StatusInternalServerError)
-		return
+		// Не возвращаем ошибку, продолжаем удаление конфигурации
 	}
 
 	// Удаляем конфиг из БД

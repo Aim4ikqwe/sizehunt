@@ -3,6 +3,7 @@ package http
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -194,6 +195,14 @@ func (h *Handler) DeleteKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	// Также очищаем ресурсы в WebSocketManager
 	go h.WebSocketManager.CleanupUserResources(userID)
+	// Дополнительно останавливаем прокси, так как без ключей сигналы не будут работать
+	if h.ProxyService != nil {
+		go func() {
+			if err := h.ProxyService.StopProxyForUser(r.Context(), userID); err != nil {
+				log.Printf("Handler: ERROR: Failed to stop proxy for user %d: %v", userID, err)
+			}
+		}()
+	}
 	log.Printf("Handler: Successfully deleted API keys for user %d", userID)
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(map[string]string{
@@ -201,6 +210,7 @@ func (h *Handler) DeleteKeys(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		log.Printf("Handler: ERROR: Failed to encode DeleteKeys response: %v", err)
 	}
+
 }
 func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
@@ -265,7 +275,41 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Проверка, есть ли уже активные сигналы для этой монеты у пользователя
+	// 4. Проверка наличия настроек прокси у пользователя
+	hasProxyConfig, err := h.ProxyService.Repo.GetProxyConfig(r.Context(), userID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("Handler: ERROR: No proxy configuration found for user %d", userID)
+			http.Error(w, "proxy configuration is required", http.StatusForbidden)
+			return
+		}
+		log.Printf("Handler: ERROR: Failed to check proxy config for user %d: %v", userID, err)
+		http.Error(w, "failed to check proxy configuration", http.StatusInternalServerError)
+		return
+	}
+	if hasProxyConfig == nil {
+		log.Printf("Handler: ERROR: No proxy configuration found for user %d", userID)
+		http.Error(w, "proxy configuration is required", http.StatusForbidden)
+		return
+	}
+
+	// Проверяем, запущен ли прокси для пользователя
+	_, hasProxy := h.ProxyService.GetProxyAddressForUser(userID)
+	if !hasProxy {
+		// Если прокси не запущен, пытаемся его запустить
+		log.Printf("Handler: Proxy not running for user %d, attempting to start", userID)
+		if err := h.ProxyService.StartProxyForUser(r.Context(), userID); err != nil {
+			log.Printf("Handler: ERROR: Failed to start proxy for user %d: %v", userID, err)
+			http.Error(w, "failed to start proxy container", http.StatusInternalServerError)
+			return
+		} else {
+			log.Printf("Handler: Proxy container started successfully for user %d", userID)
+			// Небольшая задержка для полной инициализации прокси
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+
+	// 5. Проверка, есть ли уже активные сигналы для этой монеты у пользователя
 	existingSignals, err := h.SignalRepository.GetActiveByUserAndSymbol(r.Context(), userID, req.Symbol)
 	if err != nil {
 		log.Printf("Handler: ERROR: Failed to check existing signals for user %d, symbol %s: %v", userID, req.Symbol, err)
@@ -273,7 +317,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. Деактивируем все существующие сигналы для этой монеты
+	// 6. Деактивируем все существующие сигналы для этой монеты
 	for _, existingSignal := range existingSignals {
 		if err := h.SignalRepository.Deactivate(r.Context(), existingSignal.ID); err != nil {
 			log.Printf("Handler: WARNING: Failed to deactivate existing signal %d: %v", existingSignal.ID, err)
@@ -285,7 +329,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		go h.WebSocketManager.DeleteUserSignal(userID, existingSignal.ID)
 	}
 
-	// 6. Проверка позиции для auto-close (если требуется)
+	// 7. Проверка позиции для auto-close (если требуется)
 	var positionCheckDuration time.Duration
 	var positionAmt float64
 	if req.AutoClose {
@@ -335,14 +379,8 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Handler: Position for %s is %.6f, allowing auto-close signal (check took %v)",
 			req.Symbol, positionAmt, positionCheckDuration)
 	}
-	// 7. Проверка и запуск прокси если необходимо
 
-	// 7.1. Получение ордербука (сетевая операция, но необходима)
-	if _, hasProxy := h.ProxyService.GetProxyAddressForUser(userID); !hasProxy {
-		log.Printf("Handler: ERROR: Proxy not configured for user %d. Required to create signal.", userID)
-		http.Error(w, "proxy configuration is required", http.StatusForbidden)
-		return
-	}
+	// 8. Получение ордербука через прокси
 	proxyAddr, _ := h.ProxyService.GetProxyAddressForUser(userID)
 	client := service.NewBinanceHTTPClientWithProxy(apiKey, secretKey, proxyAddr, h.Config)
 	const initialBookLimit = 1000
@@ -358,7 +396,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Handler: Orderbook fetched successfully (took %v), contains %d bids and %d asks",
 		bookDuration, len(ob.Bids), len(ob.Asks))
 
-	// 8. Поиск заявки на целевой цене
+	// 9. Поиск заявки на целевой цене
 	initialQty, initialSide := h.findOrderAtPrice(ob, req.TargetPrice, req.MinQuantity)
 	if initialQty == 0 {
 		log.Printf("Handler: ERROR: No order found at price %.8f", req.TargetPrice)
@@ -368,7 +406,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Handler: Found order at target price: %.8f, quantity: %.4f, side: %s",
 		req.TargetPrice, initialQty, initialSide)
 
-	// 9. Создание структуры сигнала для БД
+	// 10. Создание структуры сигнала для БД
 	signalDB := &repository.SignalDB{
 		UserID:          userID,
 		Symbol:          req.Symbol,
@@ -387,7 +425,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		IsActive:        true,
 	}
 
-	// 10. Сохранение в БД (блокирующая операция, но необходима перед ответом)
+	// 11. Сохранение в БД (блокирующая операция, но необходима перед ответом)
 	saveStartTime := time.Now()
 	if err := h.SignalRepository.Save(r.Context(), signalDB); err != nil {
 		log.Printf("Handler: ERROR: Failed to save signal to database: %v (took %v)", err, time.Since(saveStartTime))
@@ -396,19 +434,8 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	}
 	saveDuration := time.Since(saveStartTime)
 	log.Printf("Handler: Signal saved to database with ID %d (took %v)", signalDB.ID, saveDuration)
-	// Проверяем, запущен ли прокси для пользователя
-	_, hasProxy := h.ProxyService.GetProxyAddressForUser(userID)
-	if !hasProxy {
-		// Если прокси не запущен, пытаемся его запустить
-		log.Printf("Handler: Proxy not running for user %d, attempting to start", userID)
-		if err := h.ProxyService.StartProxyForUser(r.Context(), userID); err != nil {
-			log.Printf("Handler: WARNING: Failed to start proxy for user %d: %v", userID, err)
-			// Не возвращаем ошибку, так как сигнал уже сохранен в базе
-		} else {
-			log.Printf("Handler: Proxy container started successfully for user %d", userID)
-		}
-	}
-	// 11. Получение watcher'а с минимальным временем удержания блокировки
+
+	// 12. Получение watcher'а с минимальным временем удержания блокировки
 	log.Printf("Handler: Getting or creating watcher for user %d, symbol %s, market %s, autoClose %v",
 		userID, req.Symbol, req.Market, req.AutoClose)
 	watcherStartTime := time.Now()
@@ -426,7 +453,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("Handler: Watcher obtained successfully (took %v)", watcherDuration)
 
-	// 12. Создание сигнала для внутренней обработки
+	// 13. Создание сигнала для внутренней обработки
 	signal := &service.Signal{
 		ID:              signalDB.ID,
 		UserID:          signalDB.UserID,
@@ -445,7 +472,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:       signalDB.CreatedAt,
 	}
 
-	// 13. Формирование ответа до добавления сигнала в watcher
+	// 14. Формирование ответа до добавления сигнала в watcher
 	response := map[string]interface{}{
 		"message":          "signal created successfully",
 		"signal_id":        signal.ID,
@@ -455,13 +482,13 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		"side":             initialSide,
 	}
 
-	// 14. Отправка ответа клиенту
+	// 15. Отправка ответа клиенту
 	w.WriteHeader(http.StatusCreated)
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Handler: ERROR: Failed to encode CreateSignal response: %v", err)
 	}
 
-	// 15. Асинхронное добавление сигнала в watcher
+	// 16. Асинхронное добавление сигнала в watcher
 	log.Printf("Handler: Adding signal %d to watcher for user %d, symbol %s, initialQty %.4f, side %s (async)",
 		signal.ID, userID, req.Symbol, initialQty, initialSide)
 	go func() {

@@ -774,14 +774,13 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 	log.Printf("timeNow: %v", timeNow)
 	log.Printf("MarketDepthWatcher: SUCCESS: FULL Position closed for user %d on %s", signal.UserID, signal.CloseMarket)
 
-	// 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Не останавливаем userDataStream здесь!
-	// Вместо этого вызываем проверку на уровне WebSocketManager
+	// После успешного закрытия позиции, запускаем плавную остановку прокси
 	if w.WebSocketManager != nil {
-		log.Printf("MarketDepthWatcher: Scheduling check for UserDataStream stop for user %d", signal.UserID)
+		log.Printf("MarketDepthWatcher: Scheduling graceful proxy stop for user %d after auto-close", signal.UserID)
 		go func() {
-			// Небольшая задержка для обеспечения обновления состояния сигналов
-			time.Sleep(500 * time.Millisecond)
-			w.WebSocketManager.CheckAndStopUserDataStream(signal.UserID)
+			// Небольшая задержка для завершения всех операций
+			time.Sleep(1 * time.Second)
+			w.WebSocketManager.GracefulStopProxyForUser(signal.UserID)
 		}()
 	}
 }

@@ -487,22 +487,17 @@ func (m *WebSocketManager) DeleteUserSignal(userID int64, signalID int64) error 
 	defer func() {
 		log.Printf("WebSocketManager: DeleteUserSignal completed (total time: %v)", time.Since(startTime))
 	}()
-
 	startTime = time.Now()
-
 	m.mu.RLock()
 	uw, exists := m.userWatchers[userID]
 	m.mu.RUnlock()
-
 	if !exists {
 		return fmt.Errorf("user not found")
 	}
-
 	// Ищем сигнал и удаляем его
 	var found bool
 	var marketType string
 	var symbol string
-
 	uw.mu.Lock()
 	// Ищем в спотовых watcher'ах
 	for sym, watcher := range uw.spotWatchers {
@@ -513,7 +508,6 @@ func (m *WebSocketManager) DeleteUserSignal(userID int64, signalID int64) error 
 			break
 		}
 	}
-
 	// Если не нашли, ищем в фьючерсных
 	if !found {
 		for sym, watcher := range uw.futuresWatchers {
@@ -526,21 +520,17 @@ func (m *WebSocketManager) DeleteUserSignal(userID int64, signalID int64) error 
 		}
 	}
 	uw.mu.Unlock()
-
 	if !found {
 		return fmt.Errorf("signal not found")
 	}
-
 	// Удаляем сигнал из watcher'а асинхронно
 	go func() {
 		m.mu.RLock()
 		uw, exists := m.userWatchers[userID]
 		m.mu.RUnlock()
-
 		if !exists {
 			return
 		}
-
 		uw.mu.Lock()
 		var watcher *MarketDepthWatcher
 		if marketType == "spot" {
@@ -549,37 +539,22 @@ func (m *WebSocketManager) DeleteUserSignal(userID int64, signalID int64) error 
 			watcher = uw.futuresWatchers[symbol]
 		}
 		uw.mu.Unlock()
-
 		if watcher != nil {
 			log.Printf("WebSocketManager: Removing signal %d from watcher", signalID)
 			watcher.RemoveSignal(signalID)
 		}
-		// Проверяем наличие активных сигналов после удаления
-		activeSignals, err := m.signalRepo.GetActiveByUserID(context.Background(), userID)
-		if err != nil {
-			log.Printf("WebSocketManager: ERROR: Failed to get active signals for user %d: %v", userID, err)
-		} else if len(activeSignals) == 0 {
-			// Если активных сигналов нет, останавливаем прокси контейнер
-			log.Printf("WebSocketManager: No active signals left for user %d, stopping proxy container", userID)
-			if m.proxyService != nil {
-				if err := m.proxyService.StopProxyForUser(context.Background(), userID); err != nil {
-					log.Printf("WebSocketManager: ERROR: Failed to stop proxy for user %d: %v", userID, err)
-				} else {
-					log.Printf("WebSocketManager: Proxy container stopped successfully for user %d", userID)
-				}
-			}
-		}
+		// Не останавливаем прокси здесь, это будет сделано в GracefulStopProxyForUser
 	}()
-
 	// Удаляем сигнал из базы данных асинхронно
 	go func() {
 		if err := m.signalRepo.Delete(context.Background(), signalID); err != nil {
 			log.Printf("WebSocketManager: WARNING: Failed to delete signal %d from database: %v", signalID, err)
 		} else {
 			log.Printf("WebSocketManager: Signal %d deleted from database", signalID)
+			// Запускаем плавную остановку прокси после удаления сигнала
+			go m.GracefulStopProxyForUser(userID)
 		}
 	}()
-
 	return nil
 }
 
@@ -948,4 +923,50 @@ func (m *WebSocketManager) GetProxyAddressForUser(userID int64) (string, bool) {
 		return m.proxyService.GetProxyAddressForUser(userID)
 	}
 	return "", false
+}
+
+// GracefulStopProxyForUser обеспечивает плавную остановку прокси для пользователя
+func (m *WebSocketManager) GracefulStopProxyForUser(userID int64) {
+	log.Printf("WebSocketManager: Starting graceful stop for proxy of user %d", userID)
+
+	// 1. Проверяем, есть ли активные сигналы в базе данных
+	activeSignals, err := m.signalRepo.GetActiveByUserID(context.Background(), userID)
+	if err != nil {
+		log.Printf("WebSocketManager: ERROR: Failed to get active signals for user %d: %v", userID, err)
+		return
+	}
+
+	if len(activeSignals) > 0 {
+		log.Printf("WebSocketManager: User %d has %d active signals, skipping proxy stop", userID, len(activeSignals))
+		return
+	}
+
+	// 2. Проверяем, есть ли операции закрытия позиций в процессе
+	// (Пока нет точного способа отследить это, делаем паузу для завершения всех операций)
+	log.Printf("WebSocketManager: Waiting for position closing operations to complete for user %d...", userID)
+	time.Sleep(3 * time.Second) // Даем время на завершение всех операций с позициями
+
+	// 3. Проверяем еще раз наличие активных сигналов после паузы
+	activeSignals, err = m.signalRepo.GetActiveByUserID(context.Background(), userID)
+	if err != nil {
+		log.Printf("WebSocketManager: ERROR: Failed to re-check active signals for user %d: %v", userID, err)
+		return
+	}
+
+	if len(activeSignals) > 0 {
+		log.Printf("WebSocketManager: User %d has %d active signals after wait, skipping proxy stop", userID, len(activeSignals))
+		return
+	}
+
+	// 4. Останавливаем прокси
+	if m.proxyService != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		log.Printf("WebSocketManager: Stopping proxy container for user %d", userID)
+		if err := m.proxyService.StopProxyForUser(ctx, userID); err != nil {
+			log.Printf("WebSocketManager: ERROR: Failed to stop proxy for user %d: %v", userID, err)
+		} else {
+			log.Printf("WebSocketManager: Proxy container stopped successfully for user %d", userID)
+		}
+	}
 }

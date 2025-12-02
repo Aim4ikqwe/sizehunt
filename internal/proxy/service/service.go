@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"strings"
@@ -251,65 +252,60 @@ func (s *ProxyService) monitorContainer(ctx context.Context, userID int64, conta
 }
 
 func (s *ProxyService) StopProxyForUser(ctx context.Context, userID int64) error {
-	// Проверяем, есть ли активные операции закрытия позиций для этого пользователя
-	// Для этого можно реализовать простой счетчик или проверку состояния
-	log.Printf("ProxyService: Checking for active operations before stopping proxy for user %d", userID)
-
-	// Добавляем задержку для завершения всех операций
-	time.Sleep(3000 * time.Millisecond)
-
+	log.Printf("ProxyService: Stopping proxy for user %d", userID)
 	s.mu.Lock()
 	instance, exists := s.instances[userID]
 	if !exists || instance == nil {
 		s.mu.Unlock()
+		log.Printf("ProxyService: No proxy instance found for user %d", userID)
 		return nil
 	}
-
 	containerID := instance.ContainerID
 	config := instance.Config
 	s.mu.Unlock()
 
-	if containerID != "" {
-		log.Printf("Stopping proxy container %s for user %d", containerID, userID)
-		stopCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
+	if containerID == "" {
+		log.Printf("ProxyService: No container ID for user %d", userID)
+		return nil
+	}
 
-		// Пытаемся корректно остановить контейнер
-		err := s.dockerCli.ContainerStop(stopCtx, containerID, container.StopOptions{})
-		if err != nil {
-			log.Printf("Failed to stop container %s: %v, attempting force removal", containerID, err)
-			removeCtx, removeCancel := context.WithTimeout(ctx, 5*time.Second)
-			defer removeCancel()
-			if err := s.dockerCli.ContainerRemove(removeCtx, containerID, container.RemoveOptions{
-				Force: true,
-			}); err != nil {
-				log.Printf("Failed to remove container %s: %v", containerID, err)
-				return err
-			}
-		} else {
-			log.Printf("Container %s stopped successfully", containerID)
+	log.Printf("ProxyService: Stopping container %s for user %d", containerID, userID)
+	stopCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 
-			// Удаляем контейнер после остановки
-			removeCtx, removeCancel := context.WithTimeout(ctx, 5*time.Second)
-			defer removeCancel()
-			if err := s.dockerCli.ContainerRemove(removeCtx, containerID, container.RemoveOptions{}); err != nil {
-				log.Printf("Failed to remove container %s after stop: %v", containerID, err)
-			}
+	// Пытаемся корректно остановить контейнер
+	err := s.dockerCli.ContainerStop(stopCtx, containerID, container.StopOptions{})
+	if err != nil {
+		log.Printf("ProxyService: Failed to stop container %s: %v, attempting force removal", containerID, err)
+		removeCtx, removeCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer removeCancel()
+		if err := s.dockerCli.ContainerRemove(removeCtx, containerID, container.RemoveOptions{
+			Force: true,
+		}); err != nil {
+			log.Printf("ProxyService: Failed to remove container %s: %v", containerID, err)
+			return err
+		}
+	} else {
+		log.Printf("ProxyService: Container %s stopped successfully", containerID)
+		// Удаляем контейнер после остановки
+		removeCtx, removeCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer removeCancel()
+		if err := s.dockerCli.ContainerRemove(removeCtx, containerID, container.RemoveOptions{}); err != nil {
+			log.Printf("ProxyService: Failed to remove container %s after stop: %v", containerID, err)
 		}
 	}
 
 	if config != nil {
-		log.Printf("Updating proxy status to 'stopped' for user %d", userID)
+		log.Printf("ProxyService: Updating proxy status to 'stopped' for user %d", userID)
 		if err := s.Repo.UpdateStatus(ctx, config.ID, "stopped"); err != nil {
-			log.Printf("Failed to update proxy status for user %d: %v", userID, err)
+			log.Printf("ProxyService: Failed to update proxy status for user %d: %v", userID, err)
 		}
 	}
 
 	s.mu.Lock()
 	delete(s.instances, userID)
 	s.mu.Unlock()
-
-	log.Printf("Proxy container fully stopped and removed for user %d", userID)
+	log.Printf("ProxyService: Proxy container fully stopped and removed for user %d", userID)
 	return nil
 }
 
@@ -372,4 +368,24 @@ func (s *ProxyService) GetProxyAddressForUser(userID int64) (string, bool) {
 		return "", false
 	}
 	return fmt.Sprintf("127.0.0.1:%d", instance.Config.LocalPort), true
+}
+
+// HasProxyConfig проверяет, есть ли у пользователя сохраненные настройки прокси
+func (s *ProxyService) HasProxyConfig(userID int64) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	config, err := s.Repo.GetProxyConfig(ctx, userID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	return config != nil, nil
+}
+
+// GetProxyConfig возвращает конфигурацию прокси для пользователя
+func (s *ProxyService) GetProxyConfig(ctx context.Context, userID int64) (*proxy.ProxyConfig, error) {
+	return s.Repo.GetProxyConfig(ctx, userID)
 }
