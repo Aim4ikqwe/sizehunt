@@ -257,15 +257,22 @@ func main() {
 func shutdownServer(server *http.Server, proxyService *service.ProxyService) {
 	log.Println("Starting server shutdown process")
 
-	// Сначала останавливаем все прокси
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 1. Сначала останавливаем WebSocketManager для завершения всех операций
+	// (Это нужно добавить в WebSocketManager как метод GracefulShutdown)
+
+	// 2. Даем время на завершение всех операций с позициями - 10 секунд
+	log.Println("Waiting for position closing operations to complete...")
+	time.Sleep(10 * time.Second)
+
+	// 3. Только потом останавливаем прокси
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if proxyService != nil {
 		log.Println("Stopping all proxy containers")
 		proxyService.StopAllProxies(ctx)
 	}
 
-	// Затем останавливаем HTTP-сервер
+	// 4. Затем останавливаем HTTP-сервер
 	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {

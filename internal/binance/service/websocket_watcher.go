@@ -652,29 +652,23 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	}
 
 	// Проверяем, остались ли у пользователя активные сигналы после срабатывания триггера
+	// Изменяем часть кода в конце метода, где обрабатываем сработавшие сигналы
 	if len(signalsToRemove) > 0 {
+		// 1. Сначала выполняем все операции auto-close
+		autoCloseDone := make(chan struct{})
 		go func() {
-			time.Sleep(100 * time.Millisecond) // Небольшая задержка для завершения всех операций
-
-			// Проверяем наличие активных сигналов для пользователя
-			activeSignals, err := w.signalRepository.GetActiveByUserID(context.Background(), w.UserID)
-			if err != nil {
-				log.Printf("MarketDepthWatcher: ERROR checking active signals after trigger: %v", err)
-				return
-			}
-
-			if len(activeSignals) == 0 {
-				// Если активных сигналов нет, останавливаем прокси
-				log.Printf("MarketDepthWatcher: No active signals left for user %d after trigger, stopping proxy", w.UserID)
-				if w.WebSocketManager != nil && w.WebSocketManager.proxyService != nil {
-					if err := w.WebSocketManager.proxyService.StopProxyForUser(context.Background(), w.UserID); err != nil {
-						log.Printf("MarketDepthWatcher: ERROR stopping proxy for user %d: %v", w.UserID, err)
-					} else {
-						log.Printf("MarketDepthWatcher: Proxy container stopped successfully for user %d", w.UserID)
-					}
-				}
-			}
+			defer close(autoCloseDone)
+			time.Sleep(2000 * time.Millisecond) // Даем время на все асинхронные операции закрытия позиции
 		}()
+
+		// 2. Ждем завершения операций auto-close перед удалением сигналов
+		<-autoCloseDone
+
+		// 3. Только потом удаляем сигналы
+		for _, id := range signalsToRemove {
+			log.Printf("MarketDepthWatcher: Removing triggered signal %d after auto-close operations", id)
+			w.removeSignalByIDLocked(id)
+		}
 	}
 
 	log.Printf("MarketDepthWatcher: Depth update processing completed for %s. Removed %d signals.",

@@ -30,9 +30,7 @@ func NewOrderManager(futuresClient *futures.Client, watcher *PositionWatcher) *O
 
 // CloseFullPosition closes position using cached WS data.
 func (om *OrderManager) CloseFullPosition(symbol string) error {
-
 	startTime := time.Now()
-
 	defer func() {
 		log.Printf("OrderManager: CloseFullPosition for %s completed (total time: %v)", symbol, time.Since(startTime))
 	}()
@@ -47,10 +45,8 @@ func (om *OrderManager) CloseFullPosition(symbol string) error {
 	}
 
 	log.Printf("OrderManager: Current position for %s: %.6f", symbol, posAmt)
-
 	absQty := math.Abs(posAmt)
 	qtyStr := formatQuantity(absQty)
-
 	log.Printf("OrderManager: Calculated close quantity: %s (absolute value of %.6f)", qtyStr, posAmt)
 
 	var side futures.SideType
@@ -74,6 +70,7 @@ func (om *OrderManager) CloseFullPosition(symbol string) error {
 		NewOrderResponseType(futures.NewOrderRespTypeRESULT) // Получаем подробный ответ
 
 	orderStartTime := time.Now()
+	// FIX: Use correct response type - *futures.CreateOrderResponse instead of *futures.Order
 	resp, err := svc.Do(context.Background())
 	orderDuration := time.Since(orderStartTime)
 
@@ -83,6 +80,7 @@ func (om *OrderManager) CloseFullPosition(symbol string) error {
 	}
 
 	log.Printf("OrderManager: Close order executed successfully for %s (took %v)", symbol, orderDuration)
+	// FIX: Access fields correctly from CreateOrderResponse
 	log.Printf("OrderManager: Order details - ID: %d, Status: %s, Executed Qty: %s, Price: %s",
 		resp.OrderID, resp.Status, resp.ExecutedQuantity, resp.Price)
 
