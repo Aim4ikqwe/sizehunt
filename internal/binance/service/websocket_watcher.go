@@ -486,12 +486,6 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 
 	// Обрабатываем данные
 	binanceEventTime := time.UnixMilli(data.Data.EventTime)
-	receivedTime := time.Now()
-	networkLatency := receivedTime.Sub(binanceEventTime)
-
-	log.Printf("MarketDepthWatcher: Processing depth update for %s (%s), EventTime: %v, Received: %v, Latency: %v",
-		symbol, w.market, binanceEventTime, receivedTime, networkLatency)
-
 	// Обрабатываем сигналы для символа
 	var signalsToRemove []int64
 
@@ -952,12 +946,6 @@ func (w *MarketDepthWatcher) AddSignalAsync(signal *Signal) {
 }
 func (w *MarketDepthWatcher) processDepthUpdateAsync(data *UnifiedDepthStreamData) {
 	go func() {
-		startTime := time.Now()
-		defer func() {
-			log.Printf("MarketDepthWatcher: processDepthUpdateAsync for %s completed (total time: %v)",
-				data.Data.Symbol, time.Since(startTime))
-		}()
-
 		w.processDepthUpdate(data)
 	}()
 }

@@ -70,12 +70,12 @@ func validateEncryptionMethod(fl validator.FieldLevel) bool {
 
 type RegisterRequest struct {
 	Email    string `json:"email" validate:"required,email,max=100"`
-	Password string `json:"password" validate:"required,min=8,max=72,containsany=!@#$%^&*"`
+	Password string `json:"password" validate:"required,min=6,max=72,containsany=!@#$%^&*"`
 }
 
 type LoginRequest struct {
 	Email    string `json:"email" validate:"required,email,max=100"`
-	Password string `json:"password" validate:"required,min=8,max=72"`
+	Password string `json:"password" validate:"required,min=6,max=72"`
 }
 
 type SaveKeysRequest struct {
