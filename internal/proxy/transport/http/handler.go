@@ -2,11 +2,16 @@ package http
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
+	"sizehunt/internal/api/dto"
 	"sizehunt/internal/proxy/repository"
 	"sizehunt/internal/proxy/service"
 	"sizehunt/pkg/middleware"
+	"strings"
+
+	"github.com/go-playground/validator/v10"
 )
 
 type ProxyHandler struct {
@@ -37,11 +42,32 @@ func (h *ProxyHandler) SaveProxyConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.SSAddr == "" || req.SSMethod == "" || req.SSPassword == "" || req.SSPort == 0 {
-		http.Error(w, "all fields are required", http.StatusBadRequest)
+	// Используем стандартную валидацию через структурные теги
+	if err := dto.Validate.Struct(req); err != nil {
+		// Преобразуем ошибки валидации в человекочитаемый формат
+		errMessages := make([]string, 0)
+		for _, err := range err.(validator.ValidationErrors) {
+			field := strings.ToLower(err.Field())
+			switch err.Tag() {
+			case "required":
+				errMessages = append(errMessages, field+" is required")
+			case "min", "max":
+				errMessages = append(errMessages, field+" must be between "+err.Param()+" characters")
+			case "encryption_method":
+				errMessages = append(errMessages, "unsupported encryption method")
+			default:
+				errMessages = append(errMessages, field+" is invalid")
+			}
+		}
+		h.addErrorResponse(w, http.StatusBadRequest, strings.Join(errMessages, "; "))
 		return
 	}
 
+	// Дополнительные проверки бизнес-логики
+	if err := h.validateProxyConfigRequest(&req); err != nil {
+		h.addErrorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	log.Printf("Saving proxy config for user %d: %s:%d, method: %s", userID, req.SSAddr, req.SSPort, req.SSMethod)
 	err := h.ProxyService.ConfigureProxy(r.Context(), userID, req.SSAddr, req.SSPort, req.SSMethod, req.SSPassword)
 	if err != nil {
@@ -114,4 +140,30 @@ func (h *ProxyHandler) GetProxyStatus(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Proxy status for user %d: %s", userID, status)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// addErrorResponse формирует стандартный ответ об ошибке
+func (h *ProxyHandler) addErrorResponse(w http.ResponseWriter, statusCode int, message string) {
+	log.Printf("ProxyHandler error [%d]: %s", statusCode, message)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(map[string]string{
+		"error": message,
+	})
+}
+func (h *ProxyHandler) validateProxyConfigRequest(req *ProxyConfigRequest) error {
+	if req == nil {
+		return errors.New("empty request body")
+	}
+
+	// Дополнительные проверки, выходящие за рамки структурной валидации
+	if strings.Contains(req.SSPassword, " ") {
+		return errors.New("password cannot contain spaces")
+	}
+
+	if req.SSPort < 1 || req.SSPort > 65535 {
+		return errors.New("server port must be between 1 and 65535")
+	}
+
+	return nil
 }

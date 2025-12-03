@@ -468,11 +468,6 @@ func (w *MarketDepthWatcher) monitorActivity() {
 }
 
 func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
-	startTime := time.Now()
-	defer func() {
-		log.Printf("MarketDepthWatcher: processDepthUpdate for %s completed (total time: %v)",
-			data.Data.Symbol, time.Since(startTime))
-	}()
 
 	symbol := data.Data.Symbol
 
@@ -541,9 +536,6 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 
 	ob.LastUpdateID = data.Data.LastUpdateID
 	ob.LastUpdateTime = time.Now()
-
-	log.Printf("MarketDepthWatcher: Orderbook updated for %s. Total bids: %d, total asks: %d",
-		symbol, len(ob.Bids), len(ob.Asks))
 
 	// Обрабатываем сигналы
 	signalsForSymbol, ok := w.signalsBySymbol[symbol]
@@ -768,10 +760,6 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 		log.Printf("MarketDepthWatcher: ERROR: CloseFullPosition failed for user %d: %v", signal.UserID, err)
 		return
 	}
-	endTime := time.Since(startTime)
-	log.Printf("MarketDepthWatcher: operation ended %v", endTime)
-	timeNow := time.Now()
-	log.Printf("timeNow: %v", timeNow)
 	log.Printf("MarketDepthWatcher: SUCCESS: FULL Position closed for user %d on %s", signal.UserID, signal.CloseMarket)
 
 	// После успешного закрытия позиции, запускаем плавную остановку прокси

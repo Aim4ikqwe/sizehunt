@@ -177,7 +177,6 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 					if strings.Contains(strings.ToLower(logOutput), "error") ||
 						strings.Contains(strings.ToLower(logOutput), "fail") ||
 						strings.Contains(strings.ToLower(logOutput), "invalid") {
-						log.Printf("Container logs for %s: %s", containerName, logOutput)
 						s.dockerCli.ContainerStop(ctx, containerName, container.StopOptions{})
 						s.Repo.UpdateStatus(ctx, config.ID, "error")
 						return fmt.Errorf("container started with errors")
@@ -200,7 +199,6 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 	s.mu.Unlock()
 
 	s.Repo.UpdateStatus(ctx, config.ID, "running")
-	log.Printf("Proxy container started successfully for user %d on port %d", userID, config.LocalPort)
 
 	// Запускаем горутину для мониторинга состояния контейнера
 	go s.monitorContainer(ctx, userID, containerName)

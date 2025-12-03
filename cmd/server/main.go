@@ -159,6 +159,7 @@ func main() {
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
+	r.Use(middleware.ValidateRequest)
 
 	// Публичные роуты
 	r.Post("/auth/register", h.Register)

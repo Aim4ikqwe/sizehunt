@@ -3,14 +3,17 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"sizehunt/internal/binance/repository"
 	"sizehunt/internal/config"
 	proxy_service "sizehunt/internal/proxy/service"
 	subscriptionservice "sizehunt/internal/subscription/service"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -175,6 +178,24 @@ func (m *WebSocketManager) LoadActiveSignals() error {
 
 // createWatcherForUser создает watcher для пользователя без блокировки мьютекса на длительные операции
 func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market string, autoClose bool) (*MarketDepthWatcher, error) {
+	if symbol == "" {
+		return nil, errors.New("symbol cannot be empty")
+	}
+
+	if !strings.Contains(symbol, "USDT") && !strings.Contains(symbol, "BUSD") {
+		log.Printf("WebSocketManager: WARNING: Symbol %s may not be supported for auto-close", symbol)
+	}
+
+	// Остальная валидация
+	symbolRegex := regexp.MustCompile(`^[A-Z0-9]{3,10}$`)
+	if !symbolRegex.MatchString(symbol) {
+		return nil, fmt.Errorf("invalid symbol format: %s", symbol)
+	}
+
+	if market != "spot" && market != "futures" {
+		return nil, fmt.Errorf("unsupported market: %s", market)
+	}
+
 	// 1. Получаем или создаем UserWatcher под мьютексом
 	m.mu.Lock()
 	uw, exists := m.userWatchers[userID]
@@ -323,13 +344,6 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 
 // GetOrCreateWatcherForUser возвращает watcher для конкретного пользователя и символа
 func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, symbol, market string, autoClose bool) (*MarketDepthWatcher, error) {
-	startTime := time.Now()
-	log.Printf("WebSocketManager: GetOrCreateWatcherForUser called for user %d, symbol %s, market %s, autoClose %v",
-		userID, symbol, market, autoClose)
-	defer func() {
-		log.Printf("WebSocketManager: GetOrCreateWatcherForUser completed for user %d, symbol %s (total time: %v)",
-			userID, symbol, time.Since(startTime))
-	}()
 
 	return m.createWatcherForUser(userID, symbol, market, autoClose)
 }

@@ -66,13 +66,9 @@ func (w *PositionWatcher) setPosition(symbol string, amt float64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	oldAmt := w.positions[symbol]
 	w.positions[symbol] = amt
 	w.lastUpdate[symbol] = time.Now()
 
-	change := amt - oldAmt
-	log.Printf("PositionWatcher: %s position updated from %.6f to %.6f (change: %.6f, last updated: %v)",
-		symbol, oldAmt, amt, change, w.lastUpdate[symbol])
 }
 
 // HandleWsEvent parses WsUserDataEvent and extracts futures account updates

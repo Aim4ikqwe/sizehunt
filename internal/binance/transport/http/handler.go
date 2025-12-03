@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"runtime/debug"
 	"sizehunt/internal/api/dto"
 	"sizehunt/internal/binance/entity"
 	"sizehunt/internal/binance/repository"
@@ -19,10 +18,12 @@ import (
 	subscriptionservice "sizehunt/internal/subscription/service"
 	"sizehunt/pkg/middleware"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/adshao/go-binance/v2/futures"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
 	"github.com/sony/gobreaker"
 )
 
@@ -62,13 +63,10 @@ func NewBinanceHandler(
 }
 
 func (h *Handler) GetOrderBook(w http.ResponseWriter, r *http.Request) {
-	startTime := time.Now()
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	r = r.WithContext(ctx)
-	defer func() {
-		log.Printf("Handler: GetOrderBook completed (total time: %v)", time.Since(startTime))
-	}()
 
 	symbol := r.URL.Query().Get("symbol")
 	limitStr := r.URL.Query().Get("limit")
@@ -135,23 +133,45 @@ func (h *Handler) GetOrderBook(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) SaveKeys(w http.ResponseWriter, r *http.Request) {
-	startTime := time.Now()
-	defer func() {
-		log.Printf("Handler: SaveKeys completed (total time: %v)", time.Since(startTime))
-	}()
+
 	userID := r.Context().Value(middleware.UserIDKey).(int64)
 	var req dto.SaveKeysRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("Handler: ERROR: Invalid JSON in SaveKeys request: %v", err)
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		h.addErrorResponse(w, http.StatusBadRequest, "invalid JSON format: "+err.Error())
 		return
 	}
+
+	// Основная валидация
 	if err := dto.Validate.Struct(req); err != nil {
-		log.Printf("Handler: ERROR: Validation failed in SaveKeys: %v", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		errMessages := make([]string, 0)
+		for _, err := range err.(validator.ValidationErrors) {
+			field := strings.ToLower(strings.ReplaceAll(err.Field(), "_", " "))
+			if err.Tag() == "required" {
+				errMessages = append(errMessages, field+" is required")
+			} else {
+				errMessages = append(errMessages, field+" is invalid")
+			}
+		}
+		h.addErrorResponse(w, http.StatusBadRequest, strings.Join(errMessages, "; "))
 		return
 	}
-	log.Printf("Handler: SaveKeys called for user %d", userID)
+
+	// Дополнительные проверки безопасности
+	if strings.Contains(req.APIKey, " ") || strings.Contains(req.SecretKey, " ") {
+		h.addErrorResponse(w, http.StatusBadRequest, "API keys must not contain spaces")
+		return
+	}
+
+	if len(req.APIKey) < 64 || len(req.SecretKey) < 40 {
+		h.addErrorResponse(w, http.StatusBadRequest, "API keys appear to be too short")
+		return
+	}
+
+	// Проверка на наличие запрещенных символов
+	if strings.ContainsAny(req.APIKey, "<>{}[]()") || strings.ContainsAny(req.SecretKey, "<>{}[]()") {
+		h.addErrorResponse(w, http.StatusBadRequest, "API keys contain invalid characters")
+		return
+	}
 	// Шифруем ключи
 	secret := h.Config.EncryptionSecret
 	encryptedAPIKey, err := service.EncryptAES(req.APIKey, secret)
@@ -223,7 +243,6 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	// Восстанавливаем панику для предотвращения падения сервера
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("Handler: PANIC RECOVERED in CreateSignal: %v\n%s", r, debug.Stack())
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 		}
 	}()
@@ -231,17 +250,44 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	// 1. Валидация входных данных (быстрые операции)
 	var req dto.CreateSignalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("Handler: ERROR: Invalid JSON in CreateSignal request: %v", err)
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		h.addErrorResponse(w, http.StatusBadRequest, "invalid JSON format: "+err.Error())
 		return
 	}
+
+	// Используем стандартную валидацию через структурные теги
 	if err := dto.Validate.Struct(req); err != nil {
-		log.Printf("Handler: ERROR: Validation failed in CreateSignal: %v", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		errMessages := make([]string, 0)
+		for _, err := range err.(validator.ValidationErrors) {
+			field := strings.ToLower(strings.ReplaceAll(err.Field(), "_", " "))
+			switch err.Tag() {
+			case "required":
+				errMessages = append(errMessages, field+" is required")
+			case "gt":
+				errMessages = append(errMessages, field+" must be greater than 0")
+			case "gte", "lte":
+				errMessages = append(errMessages, field+" must be between 1% and 100%")
+			case "oneof":
+				errMessages = append(errMessages, field+" must be one of: "+err.Param())
+			case "symbol":
+				errMessages = append(errMessages, "invalid symbol format")
+			default:
+				errMessages = append(errMessages, field+" is invalid")
+			}
+		}
+		h.addErrorResponse(w, http.StatusBadRequest, strings.Join(errMessages, "; "))
 		return
 	}
-	log.Printf("Handler: CreateSignal called for user %d, symbol %s, price %.8f, market %s, autoClose %v",
-		userID, req.Symbol, req.TargetPrice, req.Market, req.AutoClose)
+
+	// Дополнительные проверки бизнес-логики
+	if req.TriggerOnEat && req.EatPercentage == 0 {
+		h.addErrorResponse(w, http.StatusBadRequest, "eat_percentage is required when trigger_on_eat is enabled")
+		return
+	}
+
+	if req.AutoClose && req.Market != "futures" {
+		h.addErrorResponse(w, http.StatusBadRequest, "auto_close is only supported for futures market")
+		return
+	}
 	// 2. Проверка подписки (быстрая операция с БД)
 	subscribed, err := h.SubscriptionService.IsUserSubscribed(r.Context(), userID)
 	if err != nil {
@@ -403,8 +449,6 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("no order found at price %.8f", req.TargetPrice), http.StatusBadRequest)
 		return
 	}
-	log.Printf("Handler: Found order at target price: %.8f, quantity: %.4f, side: %s",
-		req.TargetPrice, initialQty, initialSide)
 
 	// 10. Создание структуры сигнала для БД
 	signalDB := &repository.SignalDB{
@@ -537,14 +581,14 @@ func (h *Handler) findOrderAtPrice(ob *service.OrderBook, targetPrice, minQuanti
 }
 
 func (h *Handler) GetOrderAtPrice(w http.ResponseWriter, r *http.Request) {
-	startTime := time.Now()
-	defer func() {
-		log.Printf("Handler: GetOrderAtPrice completed (total time: %v)", time.Since(startTime))
-	}()
 
 	symbol := r.URL.Query().Get("symbol")
 	priceStr := r.URL.Query().Get("price")
 	market := r.URL.Query().Get("market")
+	if priceStr == "" {
+		h.addErrorResponse(w, http.StatusBadRequest, "price parameter is required")
+		return
+	}
 	if symbol == "" || priceStr == "" {
 		log.Printf("Handler: ERROR: Missing required parameters in GetOrderAtPrice: symbol=%s, price=%s", symbol, priceStr)
 		http.Error(w, "symbol and price are required", http.StatusBadRequest)
@@ -756,4 +800,12 @@ func (h *Handler) isBinanceAPIAvailable() bool {
 
 	state := cb.State()
 	return state == gobreaker.StateClosed || state == gobreaker.StateHalfOpen
+}
+func (h *Handler) addErrorResponse(w http.ResponseWriter, statusCode int, message string) {
+	log.Printf("BinanceHandler error [%d]: %s", statusCode, message)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(map[string]string{
+		"error": message,
+	})
 }
