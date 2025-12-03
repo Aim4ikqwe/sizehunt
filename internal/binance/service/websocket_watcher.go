@@ -730,11 +730,21 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 		log.Printf("MarketDepthWatcher: handleAutoClose for signal %d completed (total time: %v)",
 			signal.ID, time.Since(startTime))
 	}()
+
+	// Для спота с auto-close всегда используем фьючерсы для закрытия позиции
+	if signal.CloseMarket != "futures" && signal.WatchMarket == "spot" {
+		log.Printf("MarketDepthWatcher: INFO: Forcing close market to futures for spot signal %d", signal.ID)
+		signal.CloseMarket = "futures"
+	}
+
 	if signal.CloseMarket != "futures" {
 		log.Printf("MarketDepthWatcher: ERROR: handleAutoClose for non-futures market %s not implemented", signal.CloseMarket)
 		return
 	}
-	log.Printf("MarketDepthWatcher: handleAutoClose called for signal %d, user %d", signal.ID, signal.UserID)
+
+	log.Printf("MarketDepthWatcher: handleAutoClose called for signal %d, user %d, symbol %s",
+		signal.ID, signal.UserID, signal.Symbol)
+
 	// Проверка подписки (остаётся)
 	subscribed, err := w.subscriptionService.IsUserSubscribed(context.Background(), signal.UserID)
 	if err != nil {
@@ -745,8 +755,10 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 		log.Printf("MarketDepthWatcher: INFO: User %d is not subscribed, skipping auto-close", signal.UserID)
 		return
 	}
+
 	// Создание OrderManager с уже существующими зависимостями
 	manager := NewOrderManager(w.futuresClient, w.positionWatcher)
+
 	// Вызов нового метода CloseFullPosition (без side!)
 	log.Printf("MarketDepthWatcher: Attempting to close position for %s", signal.Symbol)
 	err = manager.CloseFullPosition(signal.Symbol)

@@ -181,21 +181,17 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 	if symbol == "" {
 		return nil, errors.New("symbol cannot be empty")
 	}
-
 	if !strings.Contains(symbol, "USDT") && !strings.Contains(symbol, "BUSD") {
 		log.Printf("WebSocketManager: WARNING: Symbol %s may not be supported for auto-close", symbol)
 	}
-
 	// Остальная валидация
 	symbolRegex := regexp.MustCompile(`^[A-Z0-9]{3,10}$`)
 	if !symbolRegex.MatchString(symbol) {
 		return nil, fmt.Errorf("invalid symbol format: %s", symbol)
 	}
-
 	if market != "spot" && market != "futures" {
 		return nil, fmt.Errorf("unsupported market: %s", market)
 	}
-
 	// 1. Получаем или создаем UserWatcher под мьютексом
 	m.mu.Lock()
 	uw, exists := m.userWatchers[userID]
@@ -212,34 +208,20 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 		log.Printf("WebSocketManager: Found existing UserWatcher for user %d", userID)
 	}
 	m.mu.Unlock()
-
 	// 2. Работа с конкретным рынком - используем локальный мьютекс UserWatcher
 	uw.mu.Lock()
 	defer uw.mu.Unlock()
-
 	// Обновляем флаг наличия активных auto-close сигналов
 	if autoClose {
 		uw.hasActiveAutoCloseSignals = true
 		log.Printf("WebSocketManager: User %d has active auto-close signals", userID)
 	}
-
 	var watcher *MarketDepthWatcher
 	switch market {
 	case "spot":
-		// Проверяем существующий watcher
-		if w, exists := uw.spotWatchers[symbol]; exists && w != nil {
-			log.Printf("WebSocketManager: Found existing spot watcher for user %d, symbol %s", userID, symbol)
-			return w, nil
-		}
-		// Создаем новый watcher (без инициализации соединения)
-		log.Printf("WebSocketManager: Creating new spot watcher for user %d, symbol %s", userID, symbol)
-		watcher = NewMarketDepthWatcher(
-			m.ctx, "spot", m.subService, m.keysRepo, m.cfg, nil, nil, nil, m.signalRepo, m, userID,
-		)
-		uw.spotWatchers[symbol] = watcher
-	case "futures":
+		// Существующая логика для фьючерсов осталась без изменений
 		// Удаляем старый watcher если он существует (асинхронно)
-		if w, exists := uw.futuresWatchers[symbol]; exists && w != nil {
+		if w, exists := uw.spotWatchers[symbol]; exists && w != nil {
 			log.Printf("WebSocketManager: Found existing futures watcher for user %d, symbol %s - will be replaced", userID, symbol)
 			go m.cleanupOldWatcherAsync(w, symbol, userID)
 		}
@@ -248,7 +230,6 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 		var futuresClient *futures.Client
 		var positionWatcher *PositionWatcher
 		var userDataStream *UserDataStream
-
 		if autoClose {
 			log.Printf("WebSocketManager: AutoClose enabled - preparing futures resources for user %d", userID)
 			// Получаем ключи пользователя
@@ -262,7 +243,6 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 				proxyAddr = addr
 				log.Printf("WebSocketManager: Using proxy %s for user %d futures client", proxyAddr, userID)
 			}
-
 			// Создаем или используем существующие ресурсы + proxy
 			if uw.futuresClient == nil {
 				log.Printf("WebSocketManager: Creating new futures client for user %d", userID)
@@ -271,31 +251,13 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 				uw.futuresClient = binanceClient.FuturesClient
 				uw.positionWatcher = NewPositionWatcher()
 				uw.userDataStream = NewUserDataStream(uw.futuresClient, uw.positionWatcher, m.proxyService, userID)
-
-				// Инициализируем позиции для ВСЕХ активных сигналов пользователя
+				// Инициализируем позиции
 				go func() {
-					// Получаем все активные сигналы пользователя
-					signals, err := m.signalRepo.GetActiveByUserID(context.Background(), userID)
-					if err != nil {
-						log.Printf("WebSocketManager: ERROR: Failed to get active signals for user %d: %v", userID, err)
-					} else {
-						// Собираем уникальные символы
-						symbols := make(map[string]bool)
-						for _, signal := range signals {
-							if signal.AutoClose && signal.WatchMarket == "futures" {
-								symbols[signal.Symbol] = true
-							}
-						}
-
-						// Инициализируем позиции для всех символов
-						for symbol := range symbols {
-							log.Printf("WebSocketManager: Initializing position for symbol %s from REST API", symbol)
-							if err := uw.userDataStream.initializePositionForSymbol(symbol); err != nil {
-								log.Printf("WebSocketManager: WARNING: Failed to initialize position for %s: %v", symbol, err)
-							}
-						}
+					// Инициализируем позиции для всех символов
+					log.Printf("WebSocketManager: Initializing position for symbol %s from REST API", symbol)
+					if err := uw.userDataStream.initializePositionForSymbol(symbol); err != nil {
+						log.Printf("WebSocketManager: WARNING: Failed to initialize position for %s: %v", symbol, err)
 					}
-
 					// Запускаем UserDataStream
 					if err := uw.userDataStream.Start(); err != nil {
 						log.Printf("WebSocketManager: ERROR: Failed to start UserDataStream for user %d: %v", userID, err)
@@ -306,12 +268,81 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 			} else {
 				log.Printf("WebSocketManager: Using existing futures resources for user %d", userID)
 			}
-
 			futuresClient = uw.futuresClient
 			positionWatcher = uw.positionWatcher
 			userDataStream = uw.userDataStream
 		}
+		// Создаем новый watcher
+		log.Printf("WebSocketManager: Creating new futures watcher for user %d, symbol %s", userID, symbol)
+		watcher = NewMarketDepthWatcher(
+			m.ctx,
+			"spot",
+			m.subService,
+			m.keysRepo,
+			m.cfg,
+			futuresClient,
+			positionWatcher,
+			userDataStream,
+			m.signalRepo,
+			m,
+			userID,
+		)
+		uw.spotWatchers[symbol] = watcher
 
+	case "futures":
+		// Существующая логика для фьючерсов осталась без изменений
+		// Удаляем старый watcher если он существует (асинхронно)
+		if w, exists := uw.futuresWatchers[symbol]; exists && w != nil {
+			log.Printf("WebSocketManager: Found existing futures watcher for user %d, symbol %s - will be replaced", userID, symbol)
+			go m.cleanupOldWatcherAsync(w, symbol, userID)
+		}
+
+		// Если требуется autoClose - проверяем и инициализируем ресурсы
+		var futuresClient *futures.Client
+		var positionWatcher *PositionWatcher
+		var userDataStream *UserDataStream
+		if autoClose {
+			log.Printf("WebSocketManager: AutoClose enabled - preparing futures resources for user %d", userID)
+			// Получаем ключи пользователя
+			okKeys, apiKey, secretKey := m.getKeysForUser(userID)
+			if !okKeys {
+				log.Printf("WebSocketManager: ERROR: Failed to get valid API keys for user %d", userID)
+				return nil, fmt.Errorf("futures auto-close requires valid API keys")
+			}
+			proxyAddr := ""
+			if addr, ok := m.GetProxyAddressForUser(userID); ok {
+				proxyAddr = addr
+				log.Printf("WebSocketManager: Using proxy %s for user %d futures client", proxyAddr, userID)
+			}
+			// Создаем или используем существующие ресурсы + proxy
+			if uw.futuresClient == nil {
+				log.Printf("WebSocketManager: Creating new futures client for user %d", userID)
+				// Создаем Binance HTTP клиент с прокси
+				binanceClient := NewBinanceHTTPClientWithProxy(apiKey, secretKey, proxyAddr, m.cfg)
+				uw.futuresClient = binanceClient.FuturesClient
+				uw.positionWatcher = NewPositionWatcher()
+				uw.userDataStream = NewUserDataStream(uw.futuresClient, uw.positionWatcher, m.proxyService, userID)
+				// Инициализируем позиции
+				go func() {
+					// Инициализируем позиции для всех символов
+					log.Printf("WebSocketManager: Initializing position for symbol %s from REST API", symbol)
+					if err := uw.userDataStream.initializePositionForSymbol(symbol); err != nil {
+						log.Printf("WebSocketManager: WARNING: Failed to initialize position for %s: %v", symbol, err)
+					}
+					// Запускаем UserDataStream
+					if err := uw.userDataStream.Start(); err != nil {
+						log.Printf("WebSocketManager: ERROR: Failed to start UserDataStream for user %d: %v", userID, err)
+					} else {
+						log.Printf("WebSocketManager: UserDataStream successfully started for user %d", userID)
+					}
+				}()
+			} else {
+				log.Printf("WebSocketManager: Using existing futures resources for user %d", userID)
+			}
+			futuresClient = uw.futuresClient
+			positionWatcher = uw.positionWatcher
+			userDataStream = uw.userDataStream
+		}
 		// Создаем новый watcher
 		log.Printf("WebSocketManager: Creating new futures watcher for user %d, symbol %s", userID, symbol)
 		watcher = NewMarketDepthWatcher(

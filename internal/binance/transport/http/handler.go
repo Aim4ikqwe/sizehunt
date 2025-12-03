@@ -284,10 +284,6 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.AutoClose && req.Market != "futures" {
-		h.addErrorResponse(w, http.StatusBadRequest, "auto_close is only supported for futures market")
-		return
-	}
 	// 2. Проверка подписки (быстрая операция с БД)
 	subscribed, err := h.SubscriptionService.IsUserSubscribed(r.Context(), userID)
 	if err != nil {
@@ -384,10 +380,14 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Binance API temporarily unavailable. Cannot create auto-close signal.", http.StatusServiceUnavailable)
 			return
 		}
-		if req.Market != "futures" {
-			log.Printf("Handler: ERROR: AutoClose requested for non-futures market %s", req.Market)
-			http.Error(w, "AutoClose is only supported for futures market", http.StatusBadRequest)
+		if req.Market != "futures" && req.Market != "spot" {
+			log.Printf("Handler: ERROR: AutoClose requested for unsupported market %s", req.Market)
+			http.Error(w, "AutoClose is only supported for spot and futures markets", http.StatusBadRequest)
 			return
+		}
+		// Для spot рынка с auto-close всегда используем фьючерсы для закрытия
+		if req.Market == "spot" {
+			log.Printf("Handler: WARNING: AutoClose for spot market will close positions on futures market")
 		}
 		log.Printf("Handler: AutoClose enabled, checking position for %s", req.Symbol)
 		tempFuturesClient := futures.NewClient(apiKey, secretKey)
