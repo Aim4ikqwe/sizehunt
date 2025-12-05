@@ -609,13 +609,6 @@ func (h *Handler) GetOrderAtPrice(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Handler: GetOrderAtPrice called by user %d, symbol=%s, price=%.8f, market=%s",
 		userID, symbol, price, market)
 
-	// 🔒 СТРОГАЯ ПРОВЕРКА: прокси обязан быть
-	if _, hasProxy := h.ProxyService.GetProxyAddressForUser(userID); !hasProxy {
-		log.Printf("Handler: ERROR: Proxy not configured for user %d. Required for GetOrderAtPrice.", userID)
-		http.Error(w, "proxy configuration is required", http.StatusForbidden)
-		return
-	}
-
 	// Проверяем подписку
 	subscribed, err := h.SubscriptionService.IsUserSubscribed(r.Context(), userID)
 	if err != nil {
@@ -807,5 +800,31 @@ func (h *Handler) addErrorResponse(w http.ResponseWriter, statusCode int, messag
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(map[string]string{
 		"error": message,
+	})
+}
+func (h *Handler) GetKeysStatus(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(middleware.UserIDKey).(int64)
+
+	// Проверяем наличие ключей в базе данных
+	_, err := h.KeysRepo.GetKeys(userID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// Ключи не настроены
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]bool{
+				"hasKeys": false,
+			})
+			return
+		}
+		// Другая ошибка
+		log.Printf("Handler: ERROR: Failed to check keys for user %d: %v", userID, err)
+		http.Error(w, "failed to check API keys", http.StatusInternalServerError)
+		return
+	}
+
+	// Ключи настроены
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]bool{
+		"hasKeys": true,
 	})
 }

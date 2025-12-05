@@ -538,13 +538,8 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		return
 	}
 
-	log.Printf("MarketDepthWatcher: Found %d signals to process for symbol %s", len(signalsForSymbol), symbol)
-
 	for _, signal := range signalsForSymbol {
 		found, currentQty := w.findOrderAtPrice(ob, signal.TargetPrice)
-		log.Printf("MarketDepthWatcher: Processing signal %d for price %.8f: found=%v, currentQty=%.4f, originalQty=%.4f",
-			signal.ID, signal.TargetPrice, found, currentQty, signal.OriginalQty)
-
 		// Проверка на отмену
 		if signal.TriggerOnCancel {
 			if !found && signal.OriginalQty > 0 {
@@ -583,8 +578,6 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 			if signal.OriginalQty > 0 {
 				eatenPercentage = eaten / signal.OriginalQty
 			}
-			log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), threshold: %.2f%%",
-				signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty, signal.EatPercentage*100)
 			if eatenPercentage >= signal.EatPercentage {
 				triggerTime := time.Now()
 				signal.TriggerTime = triggerTime
@@ -657,8 +650,6 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		}
 	}
 
-	log.Printf("MarketDepthWatcher: Depth update processing completed for %s. Removed %d signals.",
-		symbol, len(signalsToRemove))
 }
 
 // 🔥 НОВЫЙ МЕТОД: удаление сигнала по ID с полной очисткой ресурсов

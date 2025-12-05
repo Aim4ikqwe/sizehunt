@@ -220,6 +220,7 @@ func main() {
 		pr.Get("/api/binance/signals", binanceHandler.GetSignals)
 		pr.Delete("/api/binance/signals/{id}", binanceHandler.DeleteSignal)
 		pr.Post("/api/binance/graceful-shutdown", binanceHandler.GracefulShutdown)
+		pr.Get("/api/binance/keys/status", binanceHandler.GetKeysStatus)
 
 		// Payment routes
 		pr.Post("/api/payment/create", subHandler.CreatePayment)

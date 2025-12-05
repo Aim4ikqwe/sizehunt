@@ -1,6 +1,7 @@
 package http
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
@@ -118,8 +119,16 @@ func (h *ProxyHandler) GetProxyStatus(w http.ResponseWriter, r *http.Request) {
 
 	config, err := h.ProxyService.Repo.GetProxyConfig(r.Context(), userID)
 	if err != nil {
-		log.Printf("No proxy config found for user %d: %v", userID, err)
-		http.Error(w, "proxy not configured", http.StatusNotFound)
+		if err == sql.ErrNoRows {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"configured": false,
+				"status":     "not_configured",
+			})
+			return
+		}
+		log.Printf("Failed to get proxy config for user %d: %v", userID, err)
+		http.Error(w, "failed to get proxy config", http.StatusInternalServerError)
 		return
 	}
 
@@ -137,7 +146,6 @@ func (h *ProxyHandler) GetProxyStatus(w http.ResponseWriter, r *http.Request) {
 		"local_port": config.LocalPort,
 	}
 
-	log.Printf("Proxy status for user %d: %s", userID, status)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
