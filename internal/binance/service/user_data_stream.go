@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	proxy_service "sizehunt/internal/proxy/service"
 	"strconv"
 	"sync"
 	"time"
@@ -23,19 +22,19 @@ type UserDataStream struct {
 	mu            sync.Mutex
 	stopWsChan    chan struct{}
 	lastAlive     time.Time
-	proxyService  *proxy_service.ProxyService
+	proxyProvider ProxyProvider // Изменено с proxyService на интерфейс
 	userID        int64
-	isStopped     bool // Флаг для отслеживания состояния
+	isStopped     bool
 }
 
-func NewUserDataStream(client *futures.Client, watcher *PositionWatcher, proxyService *proxy_service.ProxyService, userID int64) *UserDataStream {
+func NewUserDataStream(client *futures.Client, watcher *PositionWatcher, proxyProvider ProxyProvider, userID int64) *UserDataStream {
 	return &UserDataStream{
 		futuresClient: client,
 		watcher:       watcher,
 		stopChan:      make(chan struct{}),
 		doneChan:      make(chan struct{}),
 		lastAlive:     time.Now(),
-		proxyService:  proxyService,
+		proxyProvider: proxyProvider, // Используем интерфейс
 		userID:        userID,
 	}
 }
@@ -139,8 +138,8 @@ func (u *UserDataStream) runWs() error {
 
 	// Получаем прокси адрес (если доступен)
 	var proxyAddr string
-	if u.proxyService != nil && u.userID != 0 {
-		if addr, ok := u.proxyService.GetProxyAddressForUser(u.userID); ok {
+	if u.proxyProvider != nil && u.userID != 0 {
+		if addr, ok := u.proxyProvider.GetProxyAddressForUser(u.userID); ok {
 			proxyAddr = addr
 		}
 	}
@@ -338,8 +337,8 @@ func (u *UserDataStream) StopWithContext(ctx context.Context) {
 		if err != nil {
 			log.Printf("UserDataStream: WARNING: Failed to delete listen key: %v (attempted via %s proxy)",
 				err, func() string {
-					if u.proxyService != nil {
-						if addr, ok := u.proxyService.GetProxyAddressForUser(u.userID); ok {
+					if u.proxyProvider != nil {
+						if addr, ok := u.proxyProvider.GetProxyAddressForUser(u.userID); ok {
 							return addr
 						}
 					}

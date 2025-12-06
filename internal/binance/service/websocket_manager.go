@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"sizehunt/internal/binance/repository"
 	"sizehunt/internal/config"
-	proxy_service "sizehunt/internal/proxy/service"
 	subscriptionservice "sizehunt/internal/subscription/service"
 	"strconv"
 	"strings"
@@ -46,7 +45,7 @@ type WebSocketManager struct {
 	networkStatus     string // "up" или "down"
 	lastNetworkChange time.Time
 	networkMu         sync.Mutex
-	proxyService      *proxy_service.ProxyService
+	proxyService      ProxyProvider
 }
 
 func NewWebSocketManager(
@@ -55,7 +54,7 @@ func NewWebSocketManager(
 	keysRepo *repository.PostgresKeysRepo,
 	signalRepo repository.SignalRepository,
 	cfg *config.Config,
-	proxyService *proxy_service.ProxyService,
+	proxyService ProxyProvider,
 ) *WebSocketManager {
 	manager := &WebSocketManager{
 		userWatchers: make(map[int64]*UserWatcher),

@@ -109,7 +109,7 @@ func main() {
 	h := userhttp.NewHandler(userService, cfg.JWTSecret, refreshTokenRepo)
 	// Proxy
 	proxyRepo := repository2.NewPostgresProxyRepo(database)
-	proxyService := service.NewProxyService(proxyRepo)
+	proxyService := service.NewProxyService(proxyRepo, cfg)
 	proxyHandler := http2.NewProxyHandler(proxyService, proxyRepo)
 	// Binance
 	keysRepo := repository.NewPostgresKeysRepo(database)

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	binance_service "sizehunt/internal/binance/service"
+	"sizehunt/internal/config"
 	"strings"
 	"sync"
 	"time"
@@ -24,9 +26,11 @@ type ProxyService struct {
 	instances map[int64]*proxy.ProxyInstance
 	mu        sync.Mutex
 	dockerCli *client.Client
+	cfg       *config.Config // добавляем конфиг для доступа к секретному ключу
+
 }
 
-func NewProxyService(repo repository.ProxyRepository) *ProxyService {
+func NewProxyService(repo repository.ProxyRepository, cfg *config.Config) *ProxyService {
 	// Инициализация Docker клиента
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -36,12 +40,20 @@ func NewProxyService(repo repository.ProxyRepository) *ProxyService {
 		Repo:      repo,
 		instances: make(map[int64]*proxy.ProxyInstance),
 		dockerCli: cli,
+		cfg:       cfg, // сохраняем конфиг
 	}
 }
 
 func (s *ProxyService) ConfigureProxy(ctx context.Context, userID int64, ssAddr string, ssPort int, ssMethod, ssPassword string) error {
 	// Сохраняем/обновляем конфиг с портом
-	localPort, err := s.Repo.SaveProxyConfig(ctx, userID, ssAddr, ssPort, ssMethod, ssPassword)
+	// Шифруем пароль перед сохранением в БД
+	encryptedPassword, err := binance_service.EncryptAES(ssPassword, s.cfg.EncryptionSecret)
+	if err != nil {
+		return errors.Wrap(err, "failed to encrypt proxy password")
+	}
+
+	// Сохраняем/обновляем конфиг с зашифрованным паролем
+	localPort, err := s.Repo.SaveProxyConfig(ctx, userID, ssAddr, ssPort, ssMethod, encryptedPassword)
 	if err != nil {
 		return errors.Wrap(err, "failed to save proxy config")
 	}
@@ -71,6 +83,12 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 		return errors.Wrap(err, "failed to get proxy config")
 	}
 
+	// Расшифровываем пароль перед использованием
+	decryptedPassword, err := binance_service.DecryptAES(config.SSPassword, s.cfg.EncryptionSecret)
+	if err != nil {
+		return errors.Wrap(err, "failed to decrypt proxy password")
+	}
+	config.SSPassword = decryptedPassword
 	// Определяем имя контейнера в самом начале
 	containerName := fmt.Sprintf("ss-proxy-%d", userID)
 
