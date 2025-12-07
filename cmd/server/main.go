@@ -20,6 +20,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
 	"github.com/jmoiron/sqlx"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"sizehunt/internal/binance/repository"
 	binance_service "sizehunt/internal/binance/service"
@@ -34,6 +37,39 @@ import (
 	userhttp "sizehunt/internal/user/transport/http"
 	"sizehunt/pkg/db"
 	"sizehunt/pkg/middleware"
+)
+
+var (
+	httpRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "http_requests_total",
+		Help: "Total number of HTTP requests",
+	}, []string{"method", "endpoint", "status"})
+
+	httpRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "http_request_duration_seconds",
+		Help:    "Duration of HTTP requests in seconds",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"method", "endpoint"})
+
+	activeSignals = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "active_signals_total",
+		Help: "Total number of active signals per user",
+	}, []string{"user_id", "symbol", "market"})
+
+	proxyContainers = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "proxy_containers_total",
+		Help: "Total number of running proxy containers",
+	})
+
+	binanceAPICalls = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "binance_api_calls_total",
+		Help: "Total number of Binance API calls",
+	}, []string{"method", "endpoint", "status", "market"})
+
+	positionUpdates = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "position_updates_total",
+		Help: "Total number of position updates",
+	}, []string{"symbol", "side"})
 )
 
 func initProxyContainers(proxyService *service.ProxyService, database *sql.DB, signalRepo repository.SignalRepository) {
@@ -158,6 +194,7 @@ func main() {
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
+	r.Use(middleware.MetricsMiddleware)
 	r.Use(middleware.ValidateRequest)
 
 	// Публичные роуты
@@ -230,6 +267,7 @@ func main() {
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("OK"))
 	})
+	r.Handle("/metrics", middleware.BasicAuth(cfg.MetricsUsername, cfg.MetricsPassword)(promhttp.Handler()))
 
 	// Устанавливаем обработчик для сервера
 	server.Handler = r

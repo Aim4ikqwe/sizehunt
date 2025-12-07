@@ -7,6 +7,7 @@ import (
 	"log"
 	binance_service "sizehunt/internal/binance/service"
 	"sizehunt/internal/config"
+	"sizehunt/internal/metrics"
 	"strings"
 	"sync"
 	"time"
@@ -36,12 +37,14 @@ func NewProxyService(repo repository.ProxyRepository, cfg *config.Config) *Proxy
 	if err != nil {
 		log.Fatalf("Failed to create Docker client: %v", err)
 	}
+	metrics.ProxyContainers.Set(0)
 	return &ProxyService{
 		Repo:      repo,
 		instances: make(map[int64]*proxy.ProxyInstance),
 		dockerCli: cli,
 		cfg:       cfg, // сохраняем конфиг
 	}
+
 }
 
 func (s *ProxyService) ConfigureProxy(ctx context.Context, userID int64, ssAddr string, ssPort int, ssMethod, ssPassword string) error {
@@ -107,6 +110,7 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 					Status:      "running",
 				}
 				s.mu.Unlock()
+				// Не увеличиваем метрику здесь, так как она уже была увеличена при первом запуске контейнера
 				return nil // Контейнер уже запущен
 			}
 		}
@@ -127,6 +131,13 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 		log.Printf("Removing existing container %s for user %d", containerName, userID)
 		if err := s.dockerCli.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true}); err != nil {
 			log.Printf("Failed to remove existing container: %v", err)
+		}
+		// Если контейнер существовал и был запущен, уменьшаем метрику
+		s.mu.Lock()
+		_, exists := s.instances[userID]
+		s.mu.Unlock()
+		if exists {
+			metrics.ProxyContainers.Dec()
 		}
 	}
 
@@ -220,6 +231,9 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 
 	// Запускаем горутину для мониторинга состояния контейнера
 	go s.monitorContainer(ctx, userID, containerName)
+
+	// Увеличиваем метрику только после успешного запуска контейнера
+	metrics.ProxyContainers.Inc()
 
 	return nil
 }
@@ -321,6 +335,7 @@ func (s *ProxyService) StopProxyForUser(ctx context.Context, userID int64) error
 	s.mu.Lock()
 	delete(s.instances, userID)
 	s.mu.Unlock()
+	metrics.ProxyContainers.Dec()
 	log.Printf("ProxyService: Proxy container fully stopped and removed for user %d", userID)
 	return nil
 }
@@ -341,6 +356,7 @@ func (s *ProxyService) StopAllProxies(ctx context.Context) {
 			log.Printf("Successfully stopped proxy for user %d", userID)
 		}
 	}
+	metrics.ProxyContainers.Set(0)
 	log.Println("All proxy containers stopped")
 }
 

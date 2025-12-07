@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"sizehunt/internal/binance/entity"
 	"sizehunt/internal/config"
+	"sizehunt/internal/metrics"
 	"strconv"
 	"time"
 
@@ -122,12 +123,35 @@ func NewBinanceHTTPClient(apiKey, secretKey string) *BinanceHTTPClient {
 }
 
 func (c *BinanceHTTPClient) GetOrderBook(symbol string, limit int, market string) (*OrderBook, error) {
+	start := time.Now()
+	defer func() {
+		duration := time.Since(start).Seconds()
+		endpoint := "orderbook"
+		status := "success"
+
+		if r := recover(); r != nil {
+			status = "panic"
+			metrics.BinanceAPIRequestsTotal.WithLabelValues(endpoint, status).Inc()
+			metrics.BinanceAPIRequestDuration.WithLabelValues(endpoint).Observe(duration)
+			panic(r)
+		}
+		// Записываем метрики успешного запроса здесь (после всех return)
+		// Но для этого нам нужно отслеживать статус отдельно
+	}()
+
 	var bidsData interface{}
 	var asksData interface{}
+	endpoint := "orderbook"
+
 	switch market {
 	case "futures":
 		if c.FuturesClient == nil {
-			return nil, fmt.Errorf("futures client not initialized, API keys required")
+			err := fmt.Errorf("futures client not initialized, API keys required")
+			// Записываем метрики для ошибки
+			duration := time.Since(start).Seconds()
+			metrics.BinanceAPIRequestsTotal.WithLabelValues(endpoint, "error").Inc()
+			metrics.BinanceAPIRequestDuration.WithLabelValues(endpoint).Observe(duration)
+			return nil, err
 		}
 		service := c.FuturesClient.NewDepthService()
 		service.Symbol(symbol)
@@ -136,6 +160,10 @@ func (c *BinanceHTTPClient) GetOrderBook(symbol string, limit int, market string
 		}
 		resp, err := service.Do(context.Background())
 		if err != nil {
+			// Записываем метрики для ошибки
+			duration := time.Since(start).Seconds()
+			metrics.BinanceAPIRequestsTotal.WithLabelValues(endpoint, "error").Inc()
+			metrics.BinanceAPIRequestDuration.WithLabelValues(endpoint).Observe(duration)
 			return nil, err
 		}
 		bidsData = resp.Bids
@@ -144,7 +172,12 @@ func (c *BinanceHTTPClient) GetOrderBook(symbol string, limit int, market string
 		fallthrough
 	default:
 		if c.SpotClient == nil {
-			return nil, fmt.Errorf("spot client not initialized, API keys required")
+			err := fmt.Errorf("spot client not initialized, API keys required")
+			// Записываем метрики для ошибки
+			duration := time.Since(start).Seconds()
+			metrics.BinanceAPIRequestsTotal.WithLabelValues(endpoint, "error").Inc()
+			metrics.BinanceAPIRequestDuration.WithLabelValues(endpoint).Observe(duration)
+			return nil, err
 		}
 		service := c.SpotClient.NewDepthService()
 		service.Symbol(symbol)
@@ -153,11 +186,14 @@ func (c *BinanceHTTPClient) GetOrderBook(symbol string, limit int, market string
 		}
 		resp, err := service.Do(context.Background())
 		if err != nil {
+			// Записываем метрики для ошибки
+			duration := time.Since(start).Seconds()
+			metrics.BinanceAPIRequestsTotal.WithLabelValues(endpoint, "error").Inc()
+			metrics.BinanceAPIRequestDuration.WithLabelValues(endpoint).Observe(duration)
 			return nil, err
 		}
 		bidsData = resp.Bids
 		asksData = resp.Asks
-
 	}
 
 	// Преобразуем bids
@@ -189,7 +225,12 @@ func (c *BinanceHTTPClient) GetOrderBook(symbol string, limit int, market string
 		}
 	default:
 		log.Printf("GetOrderBook: Unexpected bids data type: %T", bidsData)
-		return nil, fmt.Errorf("unexpected bids data type: %T", bidsData)
+		err := fmt.Errorf("unexpected bids data type: %T", bidsData)
+		// Записываем метрики для ошибки
+		duration := time.Since(start).Seconds()
+		metrics.BinanceAPIRequestsTotal.WithLabelValues(endpoint, "error").Inc()
+		metrics.BinanceAPIRequestDuration.WithLabelValues(endpoint).Observe(duration)
+		return nil, err
 	}
 
 	// Преобразуем asks
@@ -221,8 +262,19 @@ func (c *BinanceHTTPClient) GetOrderBook(symbol string, limit int, market string
 		}
 	default:
 		log.Printf("GetOrderBook: Unexpected asks data type: %T", asksData)
-		return nil, fmt.Errorf("unexpected asks data type: %T", asksData)
+		err := fmt.Errorf("unexpected asks data type: %T", asksData)
+		// Записываем метрики для ошибки
+		duration := time.Since(start).Seconds()
+		metrics.BinanceAPIRequestsTotal.WithLabelValues(endpoint, "error").Inc()
+		metrics.BinanceAPIRequestDuration.WithLabelValues(endpoint).Observe(duration)
+		return nil, err
 	}
+
+	// Записываем метрики для успешного запроса
+	duration := time.Since(start).Seconds()
+	metrics.BinanceAPIRequestsTotal.WithLabelValues(endpoint, "success").Inc()
+	metrics.BinanceAPIRequestDuration.WithLabelValues(endpoint).Observe(duration)
+
 	return &OrderBook{Bids: bids, Asks: asks}, nil
 }
 

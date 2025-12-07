@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sizehunt/internal/binance/repository"
 	"sizehunt/internal/config"
+	"sizehunt/internal/metrics"
 	subscriptionservice "sizehunt/internal/subscription/service"
 	"strconv"
 	"strings"
@@ -65,6 +66,8 @@ func NewWebSocketManager(
 		ctx:          ctx,
 		proxyService: proxyService,
 	}
+	metrics.BinanceWebSocketConnections.WithLabelValues("spot").Set(0)
+	metrics.BinanceWebSocketConnections.WithLabelValues("futures").Set(0)
 	log.Println("WebSocketManager: Initialized successfully")
 	return manager
 }
@@ -362,6 +365,11 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 		log.Printf("WebSocketManager: ERROR: Unsupported market type: %s", market)
 		return nil, fmt.Errorf("unsupported market: %s", market)
 	}
+	if market == "spot" {
+		metrics.BinanceWebSocketConnections.WithLabelValues("spot").Inc()
+	} else if market == "futures" {
+		metrics.BinanceWebSocketConnections.WithLabelValues("futures").Inc()
+	}
 	log.Printf("WebSocketManager: New watcher created for user %d, symbol %s, market %s", userID, symbol, market)
 	// 3. Запускаем соединение асинхронно
 	go func() {
@@ -369,6 +377,7 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 			log.Printf("WebSocketManager: ERROR: Failed to start connection for user %d, symbol %s: %v", userID, symbol, err)
 		}
 	}()
+
 	return watcher, nil
 }
 
@@ -420,7 +429,15 @@ func (m *WebSocketManager) cleanupOldWatcherAsync(watcher *MarketDepthWatcher, s
 	if watcher == nil {
 		return
 	}
-
+	go func() {
+		if watcher != nil {
+			if watcher.market == "spot" {
+				metrics.BinanceWebSocketConnections.WithLabelValues("spot").Dec()
+			} else if watcher.market == "futures" {
+				metrics.BinanceWebSocketConnections.WithLabelValues("futures").Dec()
+			}
+		}
+	}()
 	// Асинхронно закрываем соединение
 	go func() {
 		if watcher.client != nil {
@@ -521,6 +538,8 @@ func (m *WebSocketManager) GetUserSignals(userID int64) []SignalResponse {
 			signals = append(signals, convertSignalToResponse(s))
 		}
 	}
+	// Обновляем метрику активных сигналов для пользователя
+	metrics.BinanceActiveSignals.WithLabelValues(strconv.FormatInt(userID, 10)).Set(float64(len(signals)))
 
 	return signals
 }
