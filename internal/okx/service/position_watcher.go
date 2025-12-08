@@ -182,10 +182,6 @@ func (pw *PositionWatcher) subscribeToPositions() error {
 			"channel":  "positions",
 			"instType": "FUTURES",
 		},
-		map[string]string{
-			"channel":  "positions",
-			"instType": "SPOT",
-		},
 	}
 
 	msg := OKXWSMessage{

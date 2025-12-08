@@ -263,6 +263,15 @@ func (c *OKXHTTPClient) GetOrderBook(instID string, depth int, instType string) 
 	return result.(*OrderBook), nil
 }
 
+// Ping проверяет доступность API и поддерживает соединение (получает время сервера)
+func (c *OKXHTTPClient) Ping() error {
+	path := fmt.Sprintf("%s/public/time", OKXAPIVersion)
+
+	// Используем doRequest для использования того же http клиента
+	_, err := c.doRequest("GET", path, "")
+	return err
+}
+
 // GetPositionRisk получает информацию о позиции
 func (c *OKXHTTPClient) GetPositionRisk(instID string) (*OKXPositionResponse, error) {
 	path := fmt.Sprintf("%s/account/positions?instId=%s", OKXAPIVersion, instID)

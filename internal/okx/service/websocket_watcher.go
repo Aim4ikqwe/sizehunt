@@ -326,6 +326,9 @@ func (w *MarketDepthWatcher) StartConnection() error {
 	// Запускаем мониторинг активности
 	go w.monitorActivity()
 
+	// Запускаем поддержку HTTP соединения
+	go w.keepConnectionsAlive()
+
 	return nil
 }
 
@@ -416,8 +419,18 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 				if signal.AutoClose {
 					sigCopy := *signal
 					orderCopy := *order
+
+					// Захватываем данные позиции СИНХРОННО, пока watcher еще работает
+					var cachedPos *Position
+					if w.positionWatcher != nil && w.positionWatcher.IsRunning() {
+						if pos, exists := w.positionWatcher.GetPosition(instID); exists {
+							posCopy := *pos // Копируем структуру
+							cachedPos = &posCopy
+						}
+					}
+
 					go func() {
-						w.handleAutoClose(&sigCopy, &orderCopy)
+						w.handleAutoClose(&sigCopy, &orderCopy, cachedPos)
 					}()
 				}
 				continue
@@ -450,8 +463,18 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 				if signal.AutoClose {
 					sigCopy := *signal
 					orderCopy := *order
+
+					// Захватываем данные позиции СИНХРОННО
+					var cachedPos *Position
+					if w.positionWatcher != nil && w.positionWatcher.IsRunning() {
+						if pos, exists := w.positionWatcher.GetPosition(instID); exists {
+							posCopy := *pos
+							cachedPos = &posCopy
+						}
+					}
+
 					go func() {
-						w.handleAutoClose(&sigCopy, &orderCopy)
+						w.handleAutoClose(&sigCopy, &orderCopy, cachedPos)
 					}()
 				}
 				continue
@@ -489,7 +512,7 @@ func (w *MarketDepthWatcher) findOrderAtPrice(ob *OrderBookMap, targetPrice floa
 }
 
 // handleAutoClose обрабатывает автоматическое закрытие позиции
-func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order) {
+func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order, cachedPos *Position) {
 	startTime := time.Now()
 	defer func() {
 		log.Printf("OKXMarketDepthWatcher: handleAutoClose for signal %d completed (total time: %v)",
@@ -511,59 +534,66 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 	}
 
 	// Получаем информацию о позиции
-	var positionSize float64
+	var posToClose *Position
 
-	// Пробуем получить из PositionWatcher (WebSocket)
-	if w.positionWatcher != nil && w.positionWatcher.IsRunning() {
-		if pos, exists := w.positionWatcher.GetPosition(signal.InstID); exists {
-			positionSize = pos.Pos
-			log.Printf("OKXMarketDepthWatcher: Position from WebSocket: %s pos=%.6f, side=%s",
-				signal.InstID, positionSize, pos.PosSide)
-		} else {
-			log.Printf("OKXMarketDepthWatcher: Position not found in WebSocket cache for %s", signal.InstID)
+	// 1. Используем захваченную позицию (самый быстрый и надежный вариант)
+	if cachedPos != nil {
+		posToClose = cachedPos
+		log.Printf("OKXMarketDepthWatcher: Using SYNCHRONOUSLY captured position: pos=%.6f, side=%s",
+			posToClose.Pos, posToClose.PosSide)
+	} else {
+		// 2. Если не захватили, пробуем получить из PositionWatcher
+		if w.positionWatcher != nil && w.positionWatcher.IsRunning() {
+			if pos, exists := w.positionWatcher.GetPosition(signal.InstID); exists {
+				posToClose = pos
+				log.Printf("OKXMarketDepthWatcher: Position from WebSocket (async lookup): %s pos=%.6f, side=%s",
+					signal.InstID, posToClose.Pos, posToClose.PosSide)
+			} else {
+				log.Printf("OKXMarketDepthWatcher: Position not found in WebSocket cache for %s", signal.InstID)
+			}
 		}
 	}
 
-	// Если не получили из WebSocket, используем REST API
-	if positionSize == 0 && w.httpClient != nil {
-		log.Printf("OKXMarketDepthWatcher: Fetching position via REST API for %s", signal.InstID)
-		posResp, err := w.httpClient.GetPositionRisk(signal.InstID)
-		if err != nil {
-			log.Printf("OKXMarketDepthWatcher: ERROR: Failed to get position via REST API: %v", err)
-			return
-		}
-		if len(posResp.Data) > 0 {
-			positionSize, _ = strconv.ParseFloat(posResp.Data[0].Pos, 64)
-			log.Printf("OKXMarketDepthWatcher: Position from REST API: %s pos=%.6f, side=%s",
-				signal.InstID, positionSize, posResp.Data[0].PosSide)
+	// Проверяем есть ли позиция для закрытия
+	if posToClose == nil || posToClose.Pos == 0 {
+		// 3. Fallback на REST API (медленно, но надежно)
+		log.Printf("OKXMarketDepthWatcher: No cached position, fetching via REST API for %s", signal.InstID)
+		if w.httpClient != nil {
+			posResp, err := w.httpClient.GetPositionRisk(signal.InstID)
+			if err == nil && len(posResp.Data) > 0 {
+				p := posResp.Data[0]
+				qty, _ := strconv.ParseFloat(p.Pos, 64)
+				avgPx, _ := strconv.ParseFloat(p.AvgPx, 64)
+				upl, _ := strconv.ParseFloat(p.Upl, 64)
+
+				posToClose = &Position{
+					InstID:  p.InstID,
+					Pos:     qty,
+					PosSide: p.PosSide,
+					MgnMode: p.MgnMode,
+					AvgPx:   avgPx,
+					Upl:     upl,
+				}
+				log.Printf("OKXMarketDepthWatcher: Position from REST API: %s pos=%.6f, side=%s",
+					signal.InstID, posToClose.Pos, posToClose.PosSide)
+			}
 		}
 	}
 
-	if positionSize == 0 {
-		log.Printf("OKXMarketDepthWatcher: No position to close for %s", signal.InstID)
+	if posToClose == nil || posToClose.Pos == 0 {
+		log.Printf("OKXMarketDepthWatcher: No position to close (tried Cache, WS, REST) for %s", signal.InstID)
 		return
 	}
 
 	// Закрытие позиции через HTTP REST API
 	orderStartTime := time.Now()
-	var closeErr error
 
-	// Используем данные из PositionWatcher если доступны
-	if w.positionWatcher != nil && w.positionWatcher.IsRunning() {
-		if pos, exists := w.positionWatcher.GetPosition(signal.InstID); exists {
-			log.Printf("OKXMarketDepthWatcher: Closing position using PositionWatcher data (pos=%.6f, side=%s, mode=%s)",
-				pos.Pos, pos.PosSide, pos.MgnMode)
-			manager := NewOrderManager(w.httpClient)
-			closeErr = manager.ClosePositionWithSize(signal.InstID, pos.Pos, pos.PosSide, pos.MgnMode)
-		} else {
-			log.Printf("OKXMarketDepthWatcher: Position not in cache, using full HTTP")
-			closeErr = w.fallbackHTTPClose(signal)
-		}
-	} else {
-		// Fallback: получаем позицию через REST API
-		log.Printf("OKXMarketDepthWatcher: PositionWatcher not available, using full HTTP")
-		closeErr = w.fallbackHTTPClose(signal)
-	}
+	log.Printf("OKXMarketDepthWatcher: Closing position for %s (size: %.6f, side: %s, mode: %s)",
+		signal.InstID, posToClose.Pos, posToClose.PosSide, posToClose.MgnMode)
+
+	manager := NewOrderManager(w.httpClient)
+	// Используем ClosePositionWithSize который НЕ делает лишний fetch
+	closeErr := manager.ClosePositionWithSize(signal.InstID, posToClose.Pos, posToClose.PosSide, posToClose.MgnMode)
 
 	orderDuration := time.Since(orderStartTime)
 
@@ -575,7 +605,7 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 
 	totalDuration := time.Since(startTime)
 	log.Printf("OKXMarketDepthWatcher: ✅ SUCCESS: Position closed for user %d on %s (size: %.6f) | Order time: %v | Total time: %v",
-		signal.UserID, signal.InstID, positionSize, orderDuration, totalDuration)
+		signal.UserID, signal.InstID, posToClose.Pos, orderDuration, totalDuration)
 
 	// Плавная остановка прокси
 	if w.WebSocketManager != nil {
@@ -631,6 +661,52 @@ func (w *MarketDepthWatcher) monitorActivity() {
 			}
 		case <-w.ctx.Done():
 			return
+		}
+	}
+}
+
+// keepConnectionsAlive поддерживает HTTP соединение активным
+func (w *MarketDepthWatcher) keepConnectionsAlive() {
+	// Пингуем каждые 15 секунд (агрессивный keep-alive)
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	log.Printf("OKXMarketDepthWatcher: HTTP Keep-Alive pinger started for user %d", w.UserID)
+
+	// Делаем первый пинг сразу чтобы прогреть соединение
+	go func() {
+		w.mu.RLock()
+		client := w.httpClient
+		w.mu.RUnlock()
+		if client != nil {
+			if err := client.Ping(); err != nil {
+				log.Printf("OKXMarketDepthWatcher: Initial keep-alive ping failed: %v", err)
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-ticker.C:
+			w.mu.RLock()
+			isStarted := w.started
+			client := w.httpClient
+			w.mu.RUnlock()
+
+			if !isStarted {
+				log.Printf("OKXMarketDepthWatcher: Pinger stopped as watcher is not started")
+				return
+			}
+
+			if client != nil {
+				// Отправляем легкий запрос для поддержки соединения
+				if err := client.Ping(); err != nil {
+					log.Printf("OKXMarketDepthWatcher: Keep-alive ping failed: %v", err)
+				}
+				// Логировать успешный пинг не будем, чтобы не засорять логи
+			}
 		}
 	}
 }
