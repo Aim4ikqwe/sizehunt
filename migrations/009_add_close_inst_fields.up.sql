@@ -1,0 +1,2 @@
+ALTER TABLE okx_signals ADD COLUMN IF NOT EXISTS close_inst_id VARCHAR(30);
+ALTER TABLE okx_signals ADD COLUMN IF NOT EXISTS close_inst_type VARCHAR(10);

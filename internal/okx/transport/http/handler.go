@@ -240,6 +240,8 @@ type CreateSignalRequest struct {
 	TriggerOnEat    bool    `json:"trigger_on_eat"`
 	EatPercentage   float64 `json:"eat_percentage" validate:"omitempty,gte=0.01,lte=1"`
 	AutoClose       bool    `json:"auto_close"`
+	CloseInstID     string  `json:"close_inst_id"`   // Опционально
+	CloseInstType   string  `json:"close_inst_type"` // Опционально
 }
 
 // CreateSignal создает новый сигнал для мониторинга OKX
@@ -370,9 +372,15 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "OKX API temporarily unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		// Определяем инструмент для проверки позиции
+		targetInstID := req.InstID
+		if req.CloseInstID != "" {
+			targetInstID = req.CloseInstID
+		}
+
 		proxyAddr, _ := h.ProxyService.GetProxyAddressForUser(userID)
 		tempClient := service.NewOKXHTTPClientWithProxy(apiKey, secretKey, passphrase, proxyAddr)
-		posResp, err := tempClient.GetPositionRisk(req.InstID)
+		posResp, err := tempClient.GetPositionRisk(targetInstID)
 		if err != nil {
 			log.Printf("OKXHandler: ERROR: Failed to check position: %v", err)
 			http.Error(w, "failed to verify position", http.StatusInternalServerError)
@@ -382,10 +390,10 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 			positionAmt, _ = strconv.ParseFloat(posResp.Data[0].Pos, 64)
 		}
 		if positionAmt == 0 {
-			http.Error(w, "cannot create auto-close signal: position is zero", http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf("cannot create auto-close signal: position is zero for %s", targetInstID), http.StatusBadRequest)
 			return
 		}
-		log.Printf("OKXHandler: Position for %s is %.6f, allowing auto-close signal", req.InstID, positionAmt)
+		log.Printf("OKXHandler: Position for %s is %.6f, allowing auto-close signal", targetInstID, positionAmt)
 	}
 
 	// Получение ордербука
@@ -405,6 +413,15 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Копируем опциональные поля для закрытия (нужны указатели для БД)
+	var closeInstIDPtr, closeInstTypePtr *string
+	if req.CloseInstID != "" {
+		closeInstIDPtr = &req.CloseInstID
+	}
+	if req.CloseInstType != "" {
+		closeInstTypePtr = &req.CloseInstType
+	}
+
 	// Создание сигнала в БД
 	signalDB := &repository.SignalDB{
 		UserID:          userID,
@@ -421,6 +438,8 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		OriginalSide:    initialSide,
 		CreatedAt:       time.Now(),
 		IsActive:        true,
+		CloseInstID:     closeInstIDPtr,
+		CloseInstType:   closeInstTypePtr,
 	}
 
 	if err := h.SignalRepository.Save(r.Context(), signalDB); err != nil {
@@ -457,6 +476,8 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		AutoClose:       signalDB.AutoClose,
 		OriginalSide:    signalDB.OriginalSide,
 		CreatedAt:       signalDB.CreatedAt,
+		CloseInstID:     req.CloseInstID,
+		CloseInstType:   req.CloseInstType,
 	}
 
 	// Ответ клиенту

@@ -31,6 +31,8 @@ type Signal struct {
 	TriggerTime     time.Time // Время срабатывания триггера
 	OKXEventTime    time.Time // Время события на бирже
 	CreatedAt       time.Time // Время создания сигнала
+	CloseInstID     string    // ID инструмента для закрытия (опционально)
+	CloseInstType   string    // Тип инструмента для закрытия (опционально)
 }
 
 // OrderBookMap представляет локальный ордербук для одного инструмента
@@ -420,10 +422,16 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 					sigCopy := *signal
 					orderCopy := *order
 
+					// Определяем ID инструмента для закрытия
+					targetCloseInstID := signal.InstID
+					if signal.CloseInstID != "" {
+						targetCloseInstID = signal.CloseInstID
+					}
+
 					// Захватываем данные позиции СИНХРОННО, пока watcher еще работает
 					var cachedPos *Position
 					if w.positionWatcher != nil && w.positionWatcher.IsRunning() {
-						if pos, exists := w.positionWatcher.GetPosition(instID); exists {
+						if pos, exists := w.positionWatcher.GetPosition(targetCloseInstID); exists {
 							posCopy := *pos // Копируем структуру
 							cachedPos = &posCopy
 						}
@@ -464,10 +472,16 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 					sigCopy := *signal
 					orderCopy := *order
 
+					// Определяем ID инструмента для закрытия
+					targetCloseInstID := signal.InstID
+					if signal.CloseInstID != "" {
+						targetCloseInstID = signal.CloseInstID
+					}
+
 					// Захватываем данные позиции СИНХРОННО
 					var cachedPos *Position
 					if w.positionWatcher != nil && w.positionWatcher.IsRunning() {
-						if pos, exists := w.positionWatcher.GetPosition(instID); exists {
+						if pos, exists := w.positionWatcher.GetPosition(targetCloseInstID); exists {
 							posCopy := *pos
 							cachedPos = &posCopy
 						}
@@ -536,6 +550,13 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 	// Получаем информацию о позиции
 	var posToClose *Position
 
+	// Определяем инструмент для закрытия
+	closeInstID := signal.InstID
+	if signal.CloseInstID != "" {
+		closeInstID = signal.CloseInstID
+	}
+	// InstType нам пока не критичен для поиска позиции в кэше по ID, но пригодится если будем делать full close
+
 	// 1. Используем захваченную позицию (самый быстрый и надежный вариант)
 	if cachedPos != nil {
 		posToClose = cachedPos
@@ -544,12 +565,12 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 	} else {
 		// 2. Если не захватили, пробуем получить из PositionWatcher
 		if w.positionWatcher != nil && w.positionWatcher.IsRunning() {
-			if pos, exists := w.positionWatcher.GetPosition(signal.InstID); exists {
+			if pos, exists := w.positionWatcher.GetPosition(closeInstID); exists {
 				posToClose = pos
 				log.Printf("OKXMarketDepthWatcher: Position from WebSocket (async lookup): %s pos=%.6f, side=%s",
-					signal.InstID, posToClose.Pos, posToClose.PosSide)
+					closeInstID, posToClose.Pos, posToClose.PosSide)
 			} else {
-				log.Printf("OKXMarketDepthWatcher: Position not found in WebSocket cache for %s", signal.InstID)
+				log.Printf("OKXMarketDepthWatcher: Position not found in WebSocket cache for %s", closeInstID)
 			}
 		}
 	}
@@ -557,9 +578,9 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 	// Проверяем есть ли позиция для закрытия
 	if posToClose == nil || posToClose.Pos == 0 {
 		// 3. Fallback на REST API (медленно, но надежно)
-		log.Printf("OKXMarketDepthWatcher: No cached position, fetching via REST API for %s", signal.InstID)
+		log.Printf("OKXMarketDepthWatcher: No cached position, fetching via REST API for %s", closeInstID)
 		if w.httpClient != nil {
-			posResp, err := w.httpClient.GetPositionRisk(signal.InstID)
+			posResp, err := w.httpClient.GetPositionRisk(closeInstID)
 			if err == nil && len(posResp.Data) > 0 {
 				p := posResp.Data[0]
 				qty, _ := strconv.ParseFloat(p.Pos, 64)
@@ -575,13 +596,13 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 					Upl:     upl,
 				}
 				log.Printf("OKXMarketDepthWatcher: Position from REST API: %s pos=%.6f, side=%s",
-					signal.InstID, posToClose.Pos, posToClose.PosSide)
+					closeInstID, posToClose.Pos, posToClose.PosSide)
 			}
 		}
 	}
 
 	if posToClose == nil || posToClose.Pos == 0 {
-		log.Printf("OKXMarketDepthWatcher: No position to close (tried Cache, WS, REST) for %s", signal.InstID)
+		log.Printf("OKXMarketDepthWatcher: No position to close (tried Cache, WS, REST) for %s", closeInstID)
 		return
 	}
 
@@ -589,11 +610,11 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 	orderStartTime := time.Now()
 
 	log.Printf("OKXMarketDepthWatcher: Closing position for %s (size: %.6f, side: %s, mode: %s)",
-		signal.InstID, posToClose.Pos, posToClose.PosSide, posToClose.MgnMode)
+		closeInstID, posToClose.Pos, posToClose.PosSide, posToClose.MgnMode)
 
 	manager := NewOrderManager(w.httpClient)
 	// Используем ClosePositionWithSize который НЕ делает лишний fetch
-	closeErr := manager.ClosePositionWithSize(signal.InstID, posToClose.Pos, posToClose.PosSide, posToClose.MgnMode)
+	closeErr := manager.ClosePositionWithSize(closeInstID, posToClose.Pos, posToClose.PosSide, posToClose.MgnMode)
 
 	orderDuration := time.Since(orderStartTime)
 
@@ -605,7 +626,7 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 
 	totalDuration := time.Since(startTime)
 	log.Printf("OKXMarketDepthWatcher: ✅ SUCCESS: Position closed for user %d on %s (size: %.6f) | Order time: %v | Total time: %v",
-		signal.UserID, signal.InstID, posToClose.Pos, orderDuration, totalDuration)
+		signal.UserID, closeInstID, posToClose.Pos, orderDuration, totalDuration)
 
 	// Плавная остановка прокси
 	if w.WebSocketManager != nil {

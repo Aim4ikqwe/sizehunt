@@ -315,6 +315,9 @@ func (m *WebSocketManager) DeleteUserSignal(userID int64, signalID int64) error 
 		log.Printf("OKXWebSocketManager: WARNING: Failed to deactivate signal %d in database: %v", signalID, err)
 	}
 
+	// Проверяем и очищаем ресурсы если сигналов не осталось
+	go m.GracefulStopProxyForUser(userID)
+
 	return nil
 }
 
@@ -356,16 +359,38 @@ func (m *WebSocketManager) GetProxyAddressForUser(userID int64) (string, bool) {
 	return "", false
 }
 
-// GracefulStopProxyForUser обеспечивает плавную остановку прокси для пользователя
+// GracefulStopProxyForUser обеспечивает плавную остановку прокси и WebSocket соединений для пользователя
 func (m *WebSocketManager) GracefulStopProxyForUser(userID int64) {
-	if m.proxyService == nil {
-		return
-	}
-
 	// Проверяем, остались ли у пользователя активные сигналы
 	signals := m.GetUserSignals(userID)
 	if len(signals) > 0 {
-		log.Printf("OKXWebSocketManager: User %d still has %d active signals, not stopping proxy", userID, len(signals))
+		log.Printf("OKXWebSocketManager: User %d still has %d active signals, skipping cleanup", userID, len(signals))
+		return
+	}
+
+	log.Printf("OKXWebSocketManager: No active signals for user %d, stopping resources", userID)
+
+	m.mu.Lock()
+	userWatcher, exists := m.userWatchers[userID]
+	m.mu.Unlock()
+
+	if exists {
+		// Останавливаем TradingWebSocket
+		if userWatcher.tradingWS != nil && userWatcher.tradingWS.IsConnected() {
+			log.Printf("OKXWebSocketManager: Stopping TradingWebSocket for user %d", userID)
+			userWatcher.tradingWS.Close()
+			userWatcher.tradingWS = nil
+		}
+
+		// Останавливаем PositionWatcher
+		if userWatcher.positionWatcher != nil && userWatcher.positionWatcher.IsRunning() {
+			log.Printf("OKXWebSocketManager: Stopping PositionWatcher for user %d", userID)
+			userWatcher.positionWatcher.Stop()
+			userWatcher.positionWatcher = nil
+		}
+	}
+
+	if m.proxyService == nil {
 		return
 	}
 

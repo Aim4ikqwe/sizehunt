@@ -34,7 +34,7 @@ func (r *PostgresSignalRepo) GetActiveByUserID(ctx context.Context, userID int64
 	query := `
 		SELECT id, user_id, inst_id, inst_type, target_price, min_quantity, trigger_on_cancel, 
 		       trigger_on_eat, eat_percentage, original_qty, last_qty, auto_close, 
-		       original_side, created_at, updated_at, is_active
+		       original_side, created_at, updated_at, close_inst_id, close_inst_type, is_active
 		FROM okx_signals
 		WHERE user_id = $1 AND is_active = true
 	`
@@ -51,7 +51,7 @@ func (r *PostgresSignalRepo) GetActiveByUserID(ctx context.Context, userID int64
 			&signal.ID, &signal.UserID, &signal.InstID, &signal.InstType, &signal.TargetPrice, &signal.MinQuantity,
 			&signal.TriggerOnCancel, &signal.TriggerOnEat, &signal.EatPercentage, &signal.OriginalQty,
 			&signal.LastQty, &signal.AutoClose, &signal.OriginalSide,
-			&signal.CreatedAt, &signal.UpdatedAt, &signal.IsActive,
+			&signal.CreatedAt, &signal.UpdatedAt, &signal.CloseInstID, &signal.CloseInstType, &signal.IsActive,
 		); err != nil {
 			return nil, err
 		}
@@ -65,7 +65,7 @@ func (r *PostgresSignalRepo) GetActiveByUserAndInstID(ctx context.Context, userI
 	query := `
 		SELECT id, user_id, inst_id, inst_type, target_price, min_quantity, trigger_on_cancel, 
 		       trigger_on_eat, eat_percentage, original_qty, last_qty, auto_close, 
-		       original_side, created_at, updated_at, is_active
+		       original_side, created_at, updated_at, close_inst_id, close_inst_type, is_active
 		FROM okx_signals
 		WHERE user_id = $1 AND inst_id = $2 AND is_active = true
 		ORDER BY created_at DESC
@@ -83,7 +83,7 @@ func (r *PostgresSignalRepo) GetActiveByUserAndInstID(ctx context.Context, userI
 			&signal.ID, &signal.UserID, &signal.InstID, &signal.InstType, &signal.TargetPrice, &signal.MinQuantity,
 			&signal.TriggerOnCancel, &signal.TriggerOnEat, &signal.EatPercentage, &signal.OriginalQty,
 			&signal.LastQty, &signal.AutoClose, &signal.OriginalSide,
-			&signal.CreatedAt, &signal.UpdatedAt, &signal.IsActive,
+			&signal.CreatedAt, &signal.UpdatedAt, &signal.CloseInstID, &signal.CloseInstType, &signal.IsActive,
 		); err != nil {
 			return nil, err
 		}
@@ -97,7 +97,7 @@ func (r *PostgresSignalRepo) GetAllActiveSignals(ctx context.Context) ([]*Signal
 	query := `
 		SELECT id, user_id, inst_id, inst_type, target_price, min_quantity, trigger_on_cancel, 
 		       trigger_on_eat, eat_percentage, original_qty, last_qty, auto_close, 
-		       original_side, created_at, updated_at, is_active
+		       original_side, created_at, updated_at, close_inst_id, close_inst_type, is_active
 		FROM okx_signals
 		WHERE is_active = true
 	`
@@ -114,7 +114,7 @@ func (r *PostgresSignalRepo) GetAllActiveSignals(ctx context.Context) ([]*Signal
 			&signal.ID, &signal.UserID, &signal.InstID, &signal.InstType, &signal.TargetPrice, &signal.MinQuantity,
 			&signal.TriggerOnCancel, &signal.TriggerOnEat, &signal.EatPercentage, &signal.OriginalQty,
 			&signal.LastQty, &signal.AutoClose, &signal.OriginalSide,
-			&signal.CreatedAt, &signal.UpdatedAt, &signal.IsActive,
+			&signal.CreatedAt, &signal.UpdatedAt, &signal.CloseInstID, &signal.CloseInstType, &signal.IsActive,
 		); err != nil {
 			return nil, err
 		}
@@ -129,14 +129,14 @@ func (r *PostgresSignalRepo) Save(ctx context.Context, signal *SignalDB) error {
 		INSERT INTO okx_signals (
 			user_id, inst_id, inst_type, target_price, min_quantity, trigger_on_cancel, 
 			trigger_on_eat, eat_percentage, original_qty, last_qty, auto_close, 
-			original_side, created_at, updated_at, is_active
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW(), $13)
+			original_side, created_at, updated_at, close_inst_id, close_inst_type, is_active
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW(), $13, $14, $15)
 		RETURNING id
 	`
 	return r.DB.QueryRowContext(ctx, query,
 		signal.UserID, signal.InstID, signal.InstType, signal.TargetPrice, signal.MinQuantity,
 		signal.TriggerOnCancel, signal.TriggerOnEat, signal.EatPercentage, signal.OriginalQty,
-		signal.LastQty, signal.AutoClose, signal.OriginalSide, signal.IsActive,
+		signal.LastQty, signal.AutoClose, signal.OriginalSide, signal.CloseInstID, signal.CloseInstType, signal.IsActive,
 	).Scan(&signal.ID)
 }
 
@@ -170,7 +170,7 @@ func (r *PostgresSignalRepo) GetByID(ctx context.Context, signalID int64) (*Sign
 	query := `
         SELECT id, user_id, inst_id, inst_type, target_price, min_quantity, trigger_on_cancel, 
                trigger_on_eat, eat_percentage, original_qty, last_qty, auto_close, 
-               original_side, created_at, updated_at, is_active
+               original_side, created_at, updated_at, close_inst_id, close_inst_type, is_active
         FROM okx_signals
         WHERE id = $1
     `
@@ -179,7 +179,7 @@ func (r *PostgresSignalRepo) GetByID(ctx context.Context, signalID int64) (*Sign
 		&signal.ID, &signal.UserID, &signal.InstID, &signal.InstType, &signal.TargetPrice, &signal.MinQuantity,
 		&signal.TriggerOnCancel, &signal.TriggerOnEat, &signal.EatPercentage, &signal.OriginalQty,
 		&signal.LastQty, &signal.AutoClose, &signal.OriginalSide,
-		&signal.CreatedAt, &signal.UpdatedAt, &signal.IsActive,
+		&signal.CreatedAt, &signal.UpdatedAt, &signal.CloseInstID, &signal.CloseInstType, &signal.IsActive,
 	)
 	if err != nil {
 		return nil, err
@@ -192,7 +192,7 @@ func (r *PostgresSignalRepo) GetInactiveAutoCloseSignals(ctx context.Context) ([
 	query := `
         SELECT id, user_id, inst_id, inst_type, target_price, min_quantity, trigger_on_cancel, 
                trigger_on_eat, eat_percentage, original_qty, last_qty, auto_close, 
-               original_side, created_at, updated_at, is_active
+               original_side, created_at, updated_at, close_inst_id, close_inst_type, is_active
         FROM okx_signals
         WHERE is_active = false AND auto_close = true
         ORDER BY created_at DESC
@@ -210,7 +210,7 @@ func (r *PostgresSignalRepo) GetInactiveAutoCloseSignals(ctx context.Context) ([
 			&signal.ID, &signal.UserID, &signal.InstID, &signal.InstType, &signal.TargetPrice, &signal.MinQuantity,
 			&signal.TriggerOnCancel, &signal.TriggerOnEat, &signal.EatPercentage, &signal.OriginalQty,
 			&signal.LastQty, &signal.AutoClose, &signal.OriginalSide,
-			&signal.CreatedAt, &signal.UpdatedAt, &signal.IsActive,
+			&signal.CreatedAt, &signal.UpdatedAt, &signal.CloseInstID, &signal.CloseInstType, &signal.IsActive,
 		); err != nil {
 			return nil, err
 		}

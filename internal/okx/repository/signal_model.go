@@ -21,5 +21,7 @@ type SignalDB struct {
 	OriginalSide    string    `db:"original_side"`
 	CreatedAt       time.Time `db:"created_at"`
 	UpdatedAt       time.Time `db:"updated_at"`
+	CloseInstID     *string   `db:"close_inst_id"`   // ID инструмента для закрытия (опционально)
+	CloseInstType   *string   `db:"close_inst_type"` // Тип инструмента для закрытия (опционально)
 	IsActive        bool      `db:"is_active"`
 }
