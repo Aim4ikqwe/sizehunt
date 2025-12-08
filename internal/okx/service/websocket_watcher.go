@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sizehunt/internal/config"
 	"sizehunt/internal/okx/entity"
@@ -59,7 +60,8 @@ type MarketDepthWatcher struct {
 	signalRepository    okx_repository.SignalRepository
 	WebSocketManager    *WebSocketManager
 	UserID              int64
-	positionWatcher     *PositionWatcher // WebSocket для отслеживания позиций
+	positionWatcher     *PositionWatcher  // WebSocket для отслеживания позиций
+	tradingWS           *TradingWebSocket // WebSocket для размещения ордеров
 }
 
 // NewMarketDepthWatcher создает новый MarketDepthWatcher для OKX
@@ -166,6 +168,9 @@ func (w *MarketDepthWatcher) RemoveSignal(id int64) {
 
 	w.lastActivityTime = time.Now()
 	w.removeSignalByIDLocked(id)
+
+	// Проверяем нужно ли остановить PositionWatcher
+	w.checkAndStopPositionWatcher()
 }
 
 func (w *MarketDepthWatcher) removeSignalByIDLocked(id int64) {
@@ -216,6 +221,30 @@ func (w *MarketDepthWatcher) removeSignalByIDLocked(id int64) {
 		}
 	}
 	log.Printf("OKXMarketDepthWatcher: WARNING: Signal %d not found for removal", id)
+}
+
+// checkAndStopPositionWatcher останавливает PositionWatcher если нет auto-close сигналов
+func (w *MarketDepthWatcher) checkAndStopPositionWatcher() {
+	// Проверяем есть ли хотя бы один auto-close сигнал
+	hasAutoClose := false
+	for _, signals := range w.signalsByInstID {
+		for _, signal := range signals {
+			if signal.AutoClose {
+				hasAutoClose = true
+				break
+			}
+		}
+		if hasAutoClose {
+			break
+		}
+	}
+
+	// Если нет auto-close сигналов, останавливаем PositionWatcher
+	if !hasAutoClose && w.positionWatcher != nil && w.positionWatcher.IsRunning() {
+		log.Printf("OKXMarketDepthWatcher: No auto-close signals left, stopping PositionWatcher for user %d", w.UserID)
+		w.positionWatcher.Stop()
+		w.positionWatcher = nil
+	}
 }
 
 // StartConnection запускает WebSocket соединение
@@ -441,6 +470,11 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	for _, id := range signalsToRemove {
 		w.removeSignalByIDLocked(id)
 	}
+
+	// Проверяем нужно ли остановить PositionWatcher после удаления сигналов
+	if len(signalsToRemove) > 0 {
+		w.checkAndStopPositionWatcher()
+	}
 }
 
 // findOrderAtPrice ищет заявку в локальном ордербуке по точному совпадению цены
@@ -510,31 +544,38 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 		return
 	}
 
-	// Создание OrderManager и закрытие позиции
-	if w.httpClient != nil {
-		manager := NewOrderManager(w.httpClient)
-		var err error
-		// Используем данные из WebSocket если доступны
-		if w.positionWatcher != nil && w.positionWatcher.IsRunning() {
-			if pos, exists := w.positionWatcher.GetPosition(signal.InstID); exists {
-				// Быстрый путь - используем данные WebSocket
-				err = manager.ClosePositionWithSize(signal.InstID, pos.Pos, pos.PosSide, pos.MgnMode)
-			} else {
-				// Fallback на REST API
-				err = manager.CloseFullPosition(signal.InstID, signal.InstType)
-			}
-		} else {
-			// Fallback на REST API
-			err = manager.CloseFullPosition(signal.InstID, signal.InstType)
-		}
+	// Закрытие позиции через HTTP REST API
+	orderStartTime := time.Now()
+	var closeErr error
 
-		if err != nil {
-			log.Printf("OKXMarketDepthWatcher: ERROR: CloseFullPosition failed for user %d: %v", signal.UserID, err)
-			return
+	// Используем данные из PositionWatcher если доступны
+	if w.positionWatcher != nil && w.positionWatcher.IsRunning() {
+		if pos, exists := w.positionWatcher.GetPosition(signal.InstID); exists {
+			log.Printf("OKXMarketDepthWatcher: Closing position using PositionWatcher data (pos=%.6f, side=%s, mode=%s)",
+				pos.Pos, pos.PosSide, pos.MgnMode)
+			manager := NewOrderManager(w.httpClient)
+			closeErr = manager.ClosePositionWithSize(signal.InstID, pos.Pos, pos.PosSide, pos.MgnMode)
+		} else {
+			log.Printf("OKXMarketDepthWatcher: Position not in cache, using full HTTP")
+			closeErr = w.fallbackHTTPClose(signal)
 		}
-		log.Printf("OKXMarketDepthWatcher: SUCCESS: Position closed for user %d on %s (size: %.6f)",
-			signal.UserID, signal.InstID, positionSize)
+	} else {
+		// Fallback: получаем позицию через REST API
+		log.Printf("OKXMarketDepthWatcher: PositionWatcher not available, using full HTTP")
+		closeErr = w.fallbackHTTPClose(signal)
 	}
+
+	orderDuration := time.Since(orderStartTime)
+
+	if closeErr != nil {
+		log.Printf("OKXMarketDepthWatcher: ERROR: Position close failed for user %d: %v (order execution time: %v)",
+			signal.UserID, closeErr, orderDuration)
+		return
+	}
+
+	totalDuration := time.Since(startTime)
+	log.Printf("OKXMarketDepthWatcher: ✅ SUCCESS: Position closed for user %d on %s (size: %.6f) | Order time: %v | Total time: %v",
+		signal.UserID, signal.InstID, positionSize, orderDuration, totalDuration)
 
 	// Плавная остановка прокси
 	if w.WebSocketManager != nil {
@@ -543,6 +584,15 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 			w.WebSocketManager.GracefulStopProxyForUser(signal.UserID)
 		}()
 	}
+}
+
+// fallbackHTTPClose использует HTTP REST API для закрытия позиции
+func (w *MarketDepthWatcher) fallbackHTTPClose(signal *Signal) error {
+	if w.httpClient == nil {
+		return fmt.Errorf("HTTP client not available")
+	}
+	manager := NewOrderManager(w.httpClient)
+	return manager.CloseFullPosition(signal.InstID, signal.InstType)
 }
 
 // monitorActivity мониторит активность соединения

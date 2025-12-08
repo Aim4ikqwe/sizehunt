@@ -15,7 +15,8 @@ type UserWatcher struct {
 	watcher          *MarketDepthWatcher
 	httpClient       *OKXHTTPClient
 	signalRepository okx_repository.SignalRepository
-	positionWatcher  *PositionWatcher // WebSocket для отслеживания позиций
+	positionWatcher  *PositionWatcher  // WebSocket для отслеживания позиций
+	tradingWS        *TradingWebSocket // WebSocket для размещения ордеров
 	mu               sync.Mutex
 }
 
@@ -120,6 +121,10 @@ func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, instID, instT
 
 	userWatcher, exists := m.userWatchers[userID]
 	if exists && userWatcher.watcher != nil {
+		// Если watcher уже существует, проверяем нужно ли запустить PositionWatcher
+		if autoClose && (userWatcher.positionWatcher == nil || !userWatcher.positionWatcher.IsRunning()) {
+			m.ensurePositionWatcher(userWatcher, userID)
+		}
 		return userWatcher.watcher, nil
 	}
 
@@ -130,6 +135,7 @@ func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, instID, instT
 
 	var httpClient *OKXHTTPClient
 	var positionWatcher *PositionWatcher
+	var tradingWS *TradingWebSocket
 
 	if hasKeys {
 		// Получаем прокси
@@ -141,7 +147,17 @@ func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, instID, instT
 		}
 		httpClient = NewOKXHTTPClientWithProxy(apiKey, secretKey, passphrase, proxyAddr)
 
-		// Создаем PositionWatcher для auto-close
+		// Создаем TradingWebSocket для быстрого размещения ордеров
+		tradingWS = NewTradingWebSocket(m.ctx, apiKey, secretKey, passphrase, proxyAddr)
+		go func() {
+			if err := tradingWS.Connect(); err != nil {
+				log.Printf("OKXWebSocketManager: ERROR: Failed to connect TradingWebSocket for user %d: %v", userID, err)
+			} else {
+				log.Printf("OKXWebSocketManager: TradingWebSocket connected for user %d", userID)
+			}
+		}()
+
+		// Создаем PositionWatcher ТОЛЬКО если есть auto-close сигналы
 		if autoClose {
 			positionWatcher = NewPositionWatcher(m.ctx, apiKey, secretKey, passphrase)
 
@@ -168,8 +184,9 @@ func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, instID, instT
 		userID,
 	)
 
-	// Передаем PositionWatcher в watcher
+	// Передаем PositionWatcher и TradingWS в watcher
 	watcher.positionWatcher = positionWatcher
+	watcher.tradingWS = tradingWS
 
 	// Сохраняем watcher
 	m.userWatchers[userID] = &UserWatcher{
@@ -177,9 +194,42 @@ func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, instID, instT
 		httpClient:       httpClient,
 		signalRepository: m.signalRepo,
 		positionWatcher:  positionWatcher,
+		tradingWS:        tradingWS,
 	}
 
 	return watcher, nil
+}
+
+// ensurePositionWatcher гарантирует что PositionWatcher запущен для auto-close сигналов
+func (m *WebSocketManager) ensurePositionWatcher(userWatcher *UserWatcher, userID int64) {
+	// Получаем ключи
+	hasKeys, apiKey, secretKey, passphrase := m.getKeysForUser(userID)
+	if !hasKeys {
+		return
+	}
+
+	// Получаем прокси
+	var proxyAddr string
+	if m.proxyService != nil {
+		if addr, ok := m.proxyService.GetProxyAddressForUser(userID); ok {
+			proxyAddr = addr
+		}
+	}
+
+	// Создаем и запускаем PositionWatcher
+	positionWatcher := NewPositionWatcher(m.ctx, apiKey, secretKey, passphrase)
+	userWatcher.positionWatcher = positionWatcher
+	if userWatcher.watcher != nil {
+		userWatcher.watcher.positionWatcher = positionWatcher
+	}
+
+	go func() {
+		if err := positionWatcher.Start(proxyAddr); err != nil {
+			log.Printf("OKXWebSocketManager: ERROR: Failed to start PositionWatcher for user %d: %v", userID, err)
+		} else {
+			log.Printf("OKXWebSocketManager: PositionWatcher started for user %d (auto-close needed)", userID)
+		}
+	}()
 }
 
 // getKeysForUser получает и расшифровывает ключи пользователя
