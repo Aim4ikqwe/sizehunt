@@ -28,6 +28,9 @@ import (
 	binance_service "sizehunt/internal/binance/service"
 	binancehttp "sizehunt/internal/binance/transport/http"
 	"sizehunt/internal/config"
+	okx_repository "sizehunt/internal/okx/repository"
+	okx_service "sizehunt/internal/okx/service"
+	okxhttp "sizehunt/internal/okx/transport/http"
 	subscriptionrepository "sizehunt/internal/subscription/repository"
 	subscriptionservice "sizehunt/internal/subscription/service"
 	subscriptionhttp "sizehunt/internal/subscription/transport/http"
@@ -182,6 +185,31 @@ func main() {
 	// Передаем сервер в обработчик Binance
 	binanceHandler := binancehttp.NewBinanceHandler(binanceWatcher, keysRepo, cfg, wsManager, subService, server, signalRepo, proxyService)
 	subHandler := subscriptionhttp.NewSubscriptionHandler(subService)
+
+	// OKX
+	okxKeysRepo := okx_repository.NewPostgresKeysRepo(database)
+	okxSignalRepo := okx_repository.NewPostgresSignalRepo(dbx)
+	okxClient := okx_service.NewOKXHTTPClient("", "", "") // Инициализируем без ключей
+	okxWatcher := okx_service.NewWatcher(okxClient)
+
+	okxWSManager := okx_service.NewWebSocketManager(
+		context.Background(),
+		subService,
+		okxKeysRepo,
+		okxSignalRepo,
+		cfg,
+		proxyService,
+	)
+	go okxWSManager.StartConnectionMonitor()
+	log.Println("Loading OKX active signals from database...")
+	if err := okxWSManager.LoadActiveSignals(); err != nil {
+		log.Printf("Failed to load OKX active signals: %v", err)
+	} else {
+		log.Println("OKX active signals loaded successfully")
+	}
+
+	okxHandler := okxhttp.NewOKXHandler(okxWatcher, okxKeysRepo, cfg, okxWSManager, subService, server, okxSignalRepo, proxyService)
+
 	// --- РОУТЕР ---
 	r := chi.NewRouter()
 
@@ -258,6 +286,16 @@ func main() {
 		pr.Delete("/api/binance/signals/{id}", binanceHandler.DeleteSignal)
 		pr.Post("/api/binance/graceful-shutdown", binanceHandler.GracefulShutdown)
 		pr.Get("/api/binance/keys/status", binanceHandler.GetKeysStatus)
+
+		// OKX routes
+		pr.Get("/api/okx/book", okxHandler.GetOrderBook)
+		pr.Get("/api/okx/order-at-price", okxHandler.GetOrderAtPrice)
+		pr.Post("/api/okx/keys", okxHandler.SaveKeys)
+		pr.Delete("/api/okx/keys", okxHandler.DeleteKeys)
+		pr.Post("/api/okx/signal", okxHandler.CreateSignal)
+		pr.Get("/api/okx/signals", okxHandler.GetSignals)
+		pr.Delete("/api/okx/signals/{id}", okxHandler.DeleteSignal)
+		pr.Get("/api/okx/keys/status", okxHandler.GetKeysStatus)
 
 		// Payment routes
 		pr.Post("/api/payment/create", subHandler.CreatePayment)
