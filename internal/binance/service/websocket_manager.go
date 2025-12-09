@@ -1042,10 +1042,10 @@ func (m *WebSocketManager) GracefulStopProxyForUser(userID int64) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		log.Printf("WebSocketManager: Stopping proxy container for user %d", userID)
-		if err := m.proxyService.StopProxyForUser(ctx, userID); err != nil {
+		if err := m.proxyService.CheckAndStopProxy(ctx, userID); err != nil {
 			log.Printf("WebSocketManager: ERROR: Failed to stop proxy for user %d: %v", userID, err)
 		} else {
-			log.Printf("WebSocketManager: Proxy container stopped successfully for user %d", userID)
+			log.Printf("WebSocketManager: Checked and stopped proxy for user %d if needed", userID)
 		}
 	}
 

@@ -23,12 +23,12 @@ import (
 )
 
 type ProxyService struct {
-	Repo      repository.ProxyRepository
-	instances map[int64]*proxy.ProxyInstance
-	mu        sync.Mutex
-	dockerCli *client.Client
-	cfg       *config.Config // добавляем конфиг для доступа к секретному ключу
-
+	Repo           repository.ProxyRepository
+	instances      map[int64]*proxy.ProxyInstance
+	mu             sync.Mutex
+	dockerCli      *client.Client
+	signalCheckers []func(context.Context, int64) (bool, error)
+	cfg            *config.Config // добавляем конфиг для доступа к секретному ключу
 }
 
 func NewProxyService(repo repository.ProxyRepository, cfg *config.Config) *ProxyService {
@@ -44,7 +44,42 @@ func NewProxyService(repo repository.ProxyRepository, cfg *config.Config) *Proxy
 		dockerCli: cli,
 		cfg:       cfg, // сохраняем конфиг
 	}
+}
 
+// RegisterSignalChecker registers a function that checks for active signals
+func (s *ProxyService) RegisterSignalChecker(checker func(context.Context, int64) (bool, error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.signalCheckers = append(s.signalCheckers, checker)
+}
+
+// CheckAndStopProxy stops the proxy only if there are no active signals from any registered checker
+func (s *ProxyService) CheckAndStopProxy(ctx context.Context, userID int64) error {
+	s.mu.Lock()
+	checkers := make([]func(context.Context, int64) (bool, error), len(s.signalCheckers))
+	copy(checkers, s.signalCheckers)
+	s.mu.Unlock()
+
+	// Check all registered signal sources
+	hasActiveSignals := false
+	for _, checker := range checkers {
+		active, err := checker(ctx, userID)
+		if err != nil {
+			log.Printf("ProxyService: Error checking signals for user %d: %v", userID, err)
+			continue
+		}
+		if active {
+			hasActiveSignals = true
+			break
+		}
+	}
+
+	if hasActiveSignals {
+		log.Printf("ProxyService: User %d has active signals on one of the exchanges, skipping proxy stop", userID)
+		return nil
+	}
+
+	return s.StopProxyForUser(ctx, userID)
 }
 
 func (s *ProxyService) ConfigureProxy(ctx context.Context, userID int64, ssAddr string, ssPort int, ssMethod, ssPassword string) error {

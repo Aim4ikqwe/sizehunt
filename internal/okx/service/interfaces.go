@@ -6,6 +6,7 @@ import "context"
 type ProxyProvider interface {
 	GetProxyAddressForUser(userID int64) (string, bool)
 	StopProxyForUser(context.Context, int64) error
+	CheckAndStopProxy(context.Context, int64) error
 }
 
 // OKXClient определяет интерфейс для HTTP клиента OKX

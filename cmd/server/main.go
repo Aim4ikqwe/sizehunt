@@ -192,6 +192,23 @@ func main() {
 	okxClient := okx_service.NewOKXHTTPClient("", "", "") // Инициализируем без ключей
 	okxWatcher := okx_service.NewWatcher(okxClient)
 
+	// Регистрируем чекеры сигналов для прокси
+	proxyService.RegisterSignalChecker(func(ctx context.Context, userID int64) (bool, error) {
+		signals, err := signalRepo.GetActiveByUserID(ctx, userID)
+		if err != nil {
+			return false, err
+		}
+		return len(signals) > 0, nil
+	})
+
+	proxyService.RegisterSignalChecker(func(ctx context.Context, userID int64) (bool, error) {
+		signals, err := okxSignalRepo.GetActiveByUserID(ctx, userID)
+		if err != nil {
+			return false, err
+		}
+		return len(signals) > 0, nil
+	})
+
 	okxWSManager := okx_service.NewWebSocketManager(
 		context.Background(),
 		subService,
