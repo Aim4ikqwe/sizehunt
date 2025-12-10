@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	binance_service "sizehunt/internal/binance/service"
 	"sizehunt/internal/config"
 	"sizehunt/internal/metrics"
@@ -20,6 +22,7 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 	"github.com/pkg/errors"
+	socksproxy "golang.org/x/net/proxy"
 )
 
 type ProxyService struct {
@@ -254,6 +257,20 @@ func (s *ProxyService) StartProxyForUser(ctx context.Context, userID int64) erro
 		time.Sleep(500 * time.Millisecond)
 	}
 
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", config.LocalPort)
+	if err := s.checkExchangeConnectivity(ctx, proxyAddr); err != nil {
+		log.Printf("Proxy connectivity check failed for user %d: %v", userID, err)
+		// Stop and clean up the container to avoid leaving a broken proxy running
+		if stopErr := s.dockerCli.ContainerStop(ctx, containerName, container.StopOptions{}); stopErr != nil {
+			log.Printf("Failed to stop container %s after connectivity error: %v", containerName, stopErr)
+		}
+		if removeErr := s.dockerCli.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true}); removeErr != nil {
+			log.Printf("Failed to remove container %s after connectivity error: %v", containerName, removeErr)
+		}
+		s.Repo.UpdateStatus(ctx, config.ID, "error")
+		return errors.Wrap(err, "exchange connectivity via proxy failed")
+	}
+
 	s.mu.Lock()
 	s.instances[userID] = &proxy.ProxyInstance{
 		Config:      config,
@@ -455,4 +472,56 @@ func (s *ProxyService) HasProxyConfig(userID int64) (bool, error) {
 // GetProxyConfig возвращает конфигурацию прокси для пользователя
 func (s *ProxyService) GetProxyConfig(ctx context.Context, userID int64) (*proxy.ProxyConfig, error) {
 	return s.Repo.GetProxyConfig(ctx, userID)
+}
+
+func (s *ProxyService) checkExchangeConnectivity(ctx context.Context, proxyAddr string) error {
+	dialer, err := socksproxy.SOCKS5("tcp", proxyAddr, nil, socksproxy.Direct)
+	if err != nil {
+		return errors.Wrap(err, "failed to create SOCKS5 dialer")
+	}
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.Dial(network, addr)
+		},
+		TLSHandshakeTimeout:   10 * time.Second,
+		IdleConnTimeout:       10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   8 * time.Second,
+	}
+
+	type endpoint struct {
+		name string
+		url  string
+	}
+
+	endpoints := []endpoint{
+		{name: "Binance", url: "https://api.binance.com/api/v3/ping"},
+		{name: "OKX", url: "https://www.okx.com/api/v5/public/time"},
+	}
+
+	for _, ep := range endpoints {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep.url, nil)
+		if err != nil {
+			return errors.Wrapf(err, "%s request build failed", ep.name)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return errors.Wrapf(err, "%s unreachable via proxy", ep.name)
+		}
+
+		// Ensure body is closed promptly
+		resp.Body.Close()
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("%s returned status %d via proxy", ep.name, resp.StatusCode)
+		}
+	}
+
+	return nil
 }
