@@ -237,6 +237,19 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 	r = r.WithContext(ctx)
+	userID := r.Context().Value(middleware.UserIDKey).(int64)
+	proxyStarted := false // proxy контейнер был поднят в рамках этого запроса
+	creationSucceeded := false
+	defer func() {
+		// Очищаем прокси только если мы его запускали и сигнал так и не создался
+		if proxyStarted && !creationSucceeded {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cleanupCancel()
+			if err := h.ProxyService.CheckAndStopProxy(cleanupCtx, userID); err != nil {
+				log.Printf("Handler: ERROR: Failed to stop proxy after unsuccessful CreateSignal for user %d: %v", userID, err)
+			}
+		}
+	}()
 	defer func() {
 		log.Printf("Handler: CreateSignal completed (total time: %v)", time.Since(startTime))
 	}()
@@ -246,7 +259,6 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 		}
 	}()
-	userID := r.Context().Value(middleware.UserIDKey).(int64)
 	// 1. Валидация входных данных (быстрые операции)
 	var req dto.CreateSignalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -348,6 +360,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Handler: Proxy container started successfully for user %d", userID)
 			// Небольшая задержка для полной инициализации прокси
 			time.Sleep(500 * time.Millisecond)
+			proxyStarted = true
 		}
 	}
 
@@ -527,6 +540,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 15. Отправка ответа клиенту
+	creationSucceeded = true
 	w.WriteHeader(http.StatusCreated)
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Handler: ERROR: Failed to encode CreateSignal response: %v", err)

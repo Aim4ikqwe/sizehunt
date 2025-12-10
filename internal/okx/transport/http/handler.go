@@ -250,11 +250,21 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 	r = r.WithContext(ctx)
+	userID := r.Context().Value(middleware.UserIDKey).(int64)
+	proxyStarted := false // прокси поднимался в рамках этого запроса
+	creationSucceeded := false
+	defer func() {
+		if proxyStarted && !creationSucceeded {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cleanupCancel()
+			if err := h.ProxyService.CheckAndStopProxy(cleanupCtx, userID); err != nil {
+				log.Printf("OKXHandler: ERROR: Failed to stop proxy after unsuccessful CreateSignal for user %d: %v", userID, err)
+			}
+		}
+	}()
 	defer func() {
 		log.Printf("OKXHandler: CreateSignal completed (total time: %v)", time.Since(startTime))
 	}()
-
-	userID := r.Context().Value(middleware.UserIDKey).(int64)
 
 	// Валидация
 	var req CreateSignalRequest
@@ -349,6 +359,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		time.Sleep(500 * time.Millisecond)
+		proxyStarted = true
 	}
 
 	// Деактивируем существующие сигналы для этого инструмента
@@ -491,6 +502,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusCreated)
+	creationSucceeded = true
 	json.NewEncoder(w).Encode(response)
 
 	// Асинхронное добавление сигнала в watcher
