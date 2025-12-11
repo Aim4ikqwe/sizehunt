@@ -234,7 +234,7 @@ func (h *Handler) DeleteKeys(w http.ResponseWriter, r *http.Request) {
 }
 func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 7*time.Second)
 	defer cancel()
 	r = r.WithContext(ctx)
 	userID := r.Context().Value(middleware.UserIDKey).(int64)
@@ -483,10 +483,25 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 11. Сохранение в БД (блокирующая операция, но необходима перед ответом)
+	// Используем отдельный контекст с таймаутом для сохранения в БД, чтобы избежать проблем с истекшим контекстом запроса
 	saveStartTime := time.Now()
-	if err := h.SignalRepository.Save(r.Context(), signalDB); err != nil {
+	saveCtx, saveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer saveCancel()
+
+	// Проверяем, не истек ли основной контекст
+	if r.Context().Err() != nil {
+		log.Printf("Handler: ERROR: Request context already cancelled before save: %v", r.Context().Err())
+		http.Error(w, "request context expired", http.StatusRequestTimeout)
+		return
+	}
+
+	if err := h.SignalRepository.Save(saveCtx, signalDB); err != nil {
 		log.Printf("Handler: ERROR: Failed to save signal to database: %v (took %v)", err, time.Since(saveStartTime))
-		http.Error(w, "failed to save signal", http.StatusInternalServerError)
+		if err == context.DeadlineExceeded {
+			http.Error(w, "database operation timed out", http.StatusRequestTimeout)
+		} else {
+			http.Error(w, "failed to save signal", http.StatusInternalServerError)
+		}
 		return
 	}
 	saveDuration := time.Since(saveStartTime)

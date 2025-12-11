@@ -454,12 +454,23 @@ func (m *WebSocketManager) cleanupOldWatcherAsync(watcher *MarketDepthWatcher, s
 }
 
 // CleanupUserResources очищает все ресурсы пользователя
+// ВАЖНО: Этот метод должен вызываться только когда у пользователя точно нет активных сигналов
 func (m *WebSocketManager) CleanupUserResources(userID int64) {
 	log.Printf("WebSocketManager: Starting cleanup for user %d", userID)
 	startTime := time.Now()
 	defer func() {
 		log.Printf("WebSocketManager: Cleanup completed for user %d (total time: %v)", userID, time.Since(startTime))
 	}()
+
+	// Дополнительная проверка активных сигналов перед cleanup
+	activeSignals, err := m.signalRepo.GetActiveByUserID(context.Background(), userID)
+	if err != nil {
+		log.Printf("WebSocketManager: ERROR: Failed to check active signals during cleanup for user %d: %v", userID, err)
+		// Продолжаем cleanup, но логируем ошибку
+	} else if len(activeSignals) > 0 {
+		log.Printf("WebSocketManager: WARNING: User %d has %d active signals, aborting cleanup to prevent signal deletion", userID, len(activeSignals))
+		return
+	}
 
 	m.mu.Lock()
 	uw, exists := m.userWatchers[userID]
@@ -468,6 +479,34 @@ func (m *WebSocketManager) CleanupUserResources(userID int64) {
 		log.Printf("WebSocketManager: No resources found for user %d", userID)
 		return
 	}
+
+	// Проверяем наличие сигналов в памяти перед удалением
+	hasSignalsInMemory := false
+	if uw != nil {
+		uw.mu.Lock()
+		for _, watcher := range uw.spotWatchers {
+			if len(watcher.GetAllSignals()) > 0 {
+				hasSignalsInMemory = true
+				break
+			}
+		}
+		if !hasSignalsInMemory {
+			for _, watcher := range uw.futuresWatchers {
+				if len(watcher.GetAllSignals()) > 0 {
+					hasSignalsInMemory = true
+					break
+				}
+			}
+		}
+		uw.mu.Unlock()
+	}
+
+	if hasSignalsInMemory {
+		m.mu.Unlock()
+		log.Printf("WebSocketManager: WARNING: User %d has signals in memory, aborting cleanup to prevent signal deletion", userID)
+		return
+	}
+
 	delete(m.userWatchers, userID)
 	m.mu.Unlock()
 
@@ -1037,8 +1076,46 @@ func (m *WebSocketManager) GracefulStopProxyForUser(userID int64) {
 	}
 
 	// 4. Дополнительно проверяем и очищаем ресурсы (асинхронно)
+	// ВАЖНО: Проверяем активные сигналы перед cleanup, чтобы не удалить только что созданные сигналы
 	go func() {
 		time.Sleep(2 * time.Second)
+		// Повторно проверяем активные сигналы перед cleanup
+		activeSignals, err := m.signalRepo.GetActiveByUserID(context.Background(), userID)
+		if err != nil {
+			log.Printf("WebSocketManager: ERROR: Failed to check active signals before cleanup for user %d: %v", userID, err)
+			return
+		}
+		if len(activeSignals) > 0 {
+			log.Printf("WebSocketManager: User %d has %d active signals, skipping cleanup to avoid deleting new signals", userID, len(activeSignals))
+			return
+		}
+		// Также проверяем сигналы в памяти перед cleanup
+		m.mu.RLock()
+		uw, exists := m.userWatchers[userID]
+		m.mu.RUnlock()
+		if exists && uw != nil {
+			uw.mu.Lock()
+			hasSignals := false
+			for _, watcher := range uw.spotWatchers {
+				if len(watcher.GetAllSignals()) > 0 {
+					hasSignals = true
+					break
+				}
+			}
+			if !hasSignals {
+				for _, watcher := range uw.futuresWatchers {
+					if len(watcher.GetAllSignals()) > 0 {
+						hasSignals = true
+						break
+					}
+				}
+			}
+			uw.mu.Unlock()
+			if hasSignals {
+				log.Printf("WebSocketManager: User %d has signals in memory, skipping cleanup", userID)
+				return
+			}
+		}
 		m.CleanupUserResources(userID)
 	}()
 }
