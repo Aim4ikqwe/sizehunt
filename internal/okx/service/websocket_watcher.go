@@ -338,6 +338,21 @@ func (w *MarketDepthWatcher) StartConnection() error {
 func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	instID := data.Arg.InstID
 
+	if len(data.Data) == 0 {
+		return
+	}
+
+	depthData := data.Data[0]
+
+	// Извлекаем время события OKX (в миллисекундах как строка)
+	var okxEventTime time.Time
+	if depthData.Ts != "" {
+		if tsMs, err := strconv.ParseInt(depthData.Ts, 10, 64); err == nil {
+			okxEventTime = time.UnixMilli(tsMs)
+		}
+	}
+	updateStart := time.Now() // время начала обработки обновления
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -353,12 +368,6 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		}
 		w.orderBooks[instID] = ob
 	}
-
-	if len(data.Data) == 0 {
-		return
-	}
-
-	depthData := data.Data[0]
 
 	// Обновляем bids
 	for _, bid := range depthData.Bids {
@@ -403,10 +412,21 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		// Проверка на отмену
 		if signal.TriggerOnCancel {
 			if !found && signal.OriginalQty > 0 {
+				detectDur := time.Since(updateStart)
 				triggerTime := time.Now()
 				signal.TriggerTime = triggerTime
-				log.Printf("OKXMarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel",
-					signal.ID, signal.TargetPrice, signal.LastQty)
+				signal.OKXEventTime = okxEventTime
+				if !okxEventTime.IsZero() {
+					log.Printf("OKXMarketDepthWatcher: Trigger check (cancel) signal %d: price %.8f qty %.4f -> 0 (seqID %d, okxEvent %v, detection %v)",
+						signal.ID, signal.TargetPrice, signal.LastQty, ob.LastSeqID, okxEventTime, detectDur)
+					log.Printf("OKXMarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel at %v (latency since event: %v, detection: %v)",
+						signal.ID, signal.TargetPrice, signal.LastQty, triggerTime, time.Since(okxEventTime), detectDur)
+				} else {
+					log.Printf("OKXMarketDepthWatcher: Trigger check (cancel) signal %d: price %.8f qty %.4f -> 0 (seqID %d, detection %v)",
+						signal.ID, signal.TargetPrice, signal.LastQty, ob.LastSeqID, detectDur)
+					log.Printf("OKXMarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel at %v (detection: %v)",
+						signal.ID, signal.TargetPrice, signal.LastQty, triggerTime, detectDur)
+				}
 				order := &entity.Order{
 					Price:        signal.TargetPrice,
 					Quantity:     signal.LastQty,
@@ -453,10 +473,21 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 				eatenPercentage = eaten / signal.OriginalQty
 			}
 			if eatenPercentage >= signal.EatPercentage {
+				detectDur := time.Since(updateStart)
 				triggerTime := time.Now()
 				signal.TriggerTime = triggerTime
-				log.Printf("OKXMarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat",
-					signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty)
+				signal.OKXEventTime = okxEventTime
+				if !okxEventTime.IsZero() {
+					log.Printf("OKXMarketDepthWatcher: Trigger check (eat) signal %d: price %.8f qty %.4f -> %.4f (%.2f%% eaten, seqID %d, okxEvent %v, detection %v)",
+						signal.ID, signal.TargetPrice, signal.LastQty, currentQty, eatenPercentage*100, ob.LastSeqID, okxEventTime, detectDur)
+					log.Printf("OKXMarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat at %v (latency since event: %v, detection: %v)",
+						signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty, triggerTime, time.Since(okxEventTime), detectDur)
+				} else {
+					log.Printf("OKXMarketDepthWatcher: Trigger check (eat) signal %d: price %.8f qty %.4f -> %.4f (%.2f%% eaten, seqID %d, detection %v)",
+						signal.ID, signal.TargetPrice, signal.LastQty, currentQty, eatenPercentage*100, ob.LastSeqID, detectDur)
+					log.Printf("OKXMarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat at %v (detection: %v)",
+						signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty, triggerTime, detectDur)
+				}
 				order := &entity.Order{
 					Price:        signal.TargetPrice,
 					Quantity:     currentQty,
