@@ -1014,16 +1014,6 @@ func (m *WebSocketManager) GracefulStopProxyForUser(userID int64) {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		// Принудительно обновляем позиции перед остановкой
-		if uw.positionWatcher != nil {
-			log.Printf("WebSocketManager: Force refreshing positions before UserDataStream stop")
-			for symbol := range uw.futuresWatchers {
-				if err := uw.userDataStream.initializePositionForSymbol(symbol); err != nil {
-					log.Printf("WebSocketManager: WARNING: Failed to refresh position for %s: %v", symbol, err)
-				}
-			}
-		}
-
 		// Останавливаем UserDataStream с большим таймаутом
 		uw.userDataStream.StopWithContext(stopCtx)
 		log.Printf("WebSocketManager: UserDataStream stopped for user %d", userID)
@@ -1034,10 +1024,7 @@ func (m *WebSocketManager) GracefulStopProxyForUser(userID int64) {
 		uw.positionWatcher = nil
 	}
 
-	// 3. Ждем немного для завершения всех сетевых операций
-	time.Sleep(1 * time.Second)
-
-	// 4. Только после этого останавливаем прокси
+	// 3. Останавливаем прокси
 	if m.proxyService != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -1049,7 +1036,7 @@ func (m *WebSocketManager) GracefulStopProxyForUser(userID int64) {
 		}
 	}
 
-	// 5. Дополнительно проверяем и очищаем ресурсы
+	// 4. Дополнительно проверяем и очищаем ресурсы (асинхронно)
 	go func() {
 		time.Sleep(2 * time.Second)
 		m.CleanupUserResources(userID)

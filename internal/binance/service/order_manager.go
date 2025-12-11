@@ -23,8 +23,6 @@ func NewOrderManager(futuresClient *futures.Client, watcher *PositionWatcher) *O
 		FuturesClient: futuresClient,
 		Watcher:       watcher,
 	}
-
-	log.Println("OrderManager: Created new instance")
 	return manager
 }
 
@@ -35,8 +33,6 @@ func (om *OrderManager) CloseFullPosition(symbol string) error {
 		log.Printf("OrderManager: CloseFullPosition for %s completed (total time: %v)", symbol, time.Since(startTime))
 	}()
 
-	log.Printf("OrderManager: CloseFullPosition called for %s", symbol)
-
 	// 1. Read cached position
 	posAmt := om.Watcher.GetPosition(symbol)
 	if posAmt == 0 {
@@ -44,21 +40,16 @@ func (om *OrderManager) CloseFullPosition(symbol string) error {
 		return nil
 	}
 
-	log.Printf("OrderManager: Current position for %s: %.6f", symbol, posAmt)
 	absQty := math.Abs(posAmt)
 	qtyStr := formatQuantity(absQty)
-	log.Printf("OrderManager: Calculated close quantity: %s (absolute value of %.6f)", qtyStr, posAmt)
-
 	var side futures.SideType
 	if posAmt > 0 {
 		side = futures.SideTypeSell
-		log.Printf("OrderManager: Position is LONG (%.6f), will close with SELL order", posAmt)
 	} else {
 		side = futures.SideTypeBuy
-		log.Printf("OrderManager: Position is SHORT (%.6f), will close with BUY order", posAmt)
 	}
 
-	log.Printf("OrderManager: Executing MARKET close order for %s: %s %s", symbol, side, qtyStr)
+	log.Printf("OrderManager: Closing %s position %.6f with MARKET %s %s", symbol, posAmt, side, qtyStr)
 
 	// 2. Send MARKET close order
 	svc := om.FuturesClient.NewCreateOrderService()
@@ -84,15 +75,14 @@ func (om *OrderManager) CloseFullPosition(symbol string) error {
 	log.Printf("OrderManager: Order details - ID: %d, Status: %s, Executed Qty: %s, Price: %s",
 		resp.OrderID, resp.Status, resp.ExecutedQuantity, resp.Price)
 
-	// 🔥 КРИТИЧЕСКИ ВАЖНО: Не ждем синхронного обновления через WebSocket
-	// Запускаем асинхронное обновление и возвращаем управление
+	// Асинхронно освежаем позицию после отправки ордера (без блокировки основного потока)
 	go func() {
-		time.Sleep(500 * time.Millisecond) // Небольшая задержка для отправки ордера
-		log.Printf("OrderManager: Forcing position refresh from REST API for %s", symbol)
+		time.Sleep(500 * time.Millisecond) // небольшая пауза, чтобы WS успел принести апдейт
+		log.Printf("OrderManager: Forcing position refresh from REST API for %s (post-close)", symbol)
 		if err := om.refreshPositionFromREST(symbol); err != nil {
 			log.Printf("OrderManager: WARNING: Failed to refresh position from REST: %v", err)
 		} else {
-			log.Printf("OrderManager: Position for %s successfully refreshed from REST", symbol)
+			log.Printf("OrderManager: Position for %s refreshed from REST", symbol)
 		}
 	}()
 

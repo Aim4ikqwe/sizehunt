@@ -470,10 +470,11 @@ func (w *MarketDepthWatcher) monitorActivity() {
 func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 
 	symbol := data.Data.Symbol
+	binanceEventTime := time.UnixMilli(data.Data.EventTime)
+	updateStart := time.Now() // время начала обработки обновления
 
 	w.mu.RLock()
 	// Проверяем, активен ли символ и есть ли сигналы
-	_, _ = w.orderBooks[symbol]
 	signalsCount := len(w.signalsBySymbol[symbol])
 	active := w.activeSymbols[symbol]
 	w.mu.RUnlock()
@@ -484,8 +485,6 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		return
 	}
 
-	// Обрабатываем данные
-	binanceEventTime := time.UnixMilli(data.Data.EventTime)
 	// Обрабатываем сигналы для символа
 	var signalsToRemove []int64
 
@@ -543,11 +542,14 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		// Проверка на отмену
 		if signal.TriggerOnCancel {
 			if !found && signal.OriginalQty > 0 {
+				detectDur := time.Since(updateStart)
+				log.Printf("MarketDepthWatcher: Trigger check (cancel) signal %d: price %.8f qty %.4f -> 0 (updateID %d, binanceEvent %v, detection %v)",
+					signal.ID, signal.TargetPrice, signal.LastQty, ob.LastUpdateID, binanceEventTime, detectDur)
 				triggerTime := time.Now()
 				signal.TriggerTime = triggerTime
 				signal.BinanceEventTime = binanceEventTime
-				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel at %v",
-					signal.ID, signal.TargetPrice, signal.LastQty, triggerTime)
+				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel at %v (latency since event: %v, detection: %v)",
+					signal.ID, signal.TargetPrice, signal.LastQty, triggerTime, time.Since(binanceEventTime), detectDur)
 				order := &entity.Order{
 					Price:    signal.TargetPrice,
 					Quantity: signal.LastQty,
@@ -579,11 +581,14 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 				eatenPercentage = eaten / signal.OriginalQty
 			}
 			if eatenPercentage >= signal.EatPercentage {
+				detectDur := time.Since(updateStart)
+				log.Printf("MarketDepthWatcher: Trigger check (eat) signal %d: price %.8f qty %.4f -> %.4f (%.2f%% eaten, updateID %d, binanceEvent %v, detection %v)",
+					signal.ID, signal.TargetPrice, signal.LastQty, currentQty, eatenPercentage*100, ob.LastUpdateID, binanceEventTime, detectDur)
 				triggerTime := time.Now()
 				signal.TriggerTime = triggerTime
 				signal.BinanceEventTime = binanceEventTime
-				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat at %v",
-					signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty, triggerTime)
+				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat at %v (latency since event: %v, detection: %v)",
+					signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty, triggerTime, time.Since(binanceEventTime), detectDur)
 				order := &entity.Order{
 					Price:    signal.TargetPrice,
 					Quantity: currentQty,
