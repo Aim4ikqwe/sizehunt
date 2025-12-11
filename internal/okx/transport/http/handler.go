@@ -247,7 +247,7 @@ type CreateSignalRequest struct {
 // CreateSignal создает новый сигнал для мониторинга OKX
 func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	r = r.WithContext(ctx)
 	userID := r.Context().Value(middleware.UserIDKey).(int64)
@@ -255,7 +255,7 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	creationSucceeded := false
 	defer func() {
 		if proxyStarted && !creationSucceeded {
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cleanupCancel()
 			if err := h.ProxyService.CheckAndStopProxy(cleanupCtx, userID); err != nil {
 				log.Printf("OKXHandler: ERROR: Failed to stop proxy after unsuccessful CreateSignal for user %d: %v", userID, err)
