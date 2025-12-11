@@ -53,9 +53,8 @@ type OrderBookMap struct {
 // MarketDepthWatcher отвечает за один рынок (spot или futures) и управляет сигналами и локальным ордербуком для разных символов на этом рынке
 type MarketDepthWatcher struct {
 	client              *WebSocketClient
-	signalsBySymbol     map[string][]*Signal             // symbol -> []signals
-	signalsIndexByPrice map[string]map[float64][]*Signal // symbol -> price -> []signals (для O(1) доступа по цене)
-	orderBooks          map[string]*OrderBookMap         // symbol -> OrderBookMap (локальный ордербук)
+	signalsBySymbol     map[string][]*Signal     // symbol -> []signals
+	orderBooks          map[string]*OrderBookMap // symbol -> OrderBookMap (локальный ордербук)
 	mu                  sync.RWMutex
 	onTrigger           func(signal *Signal, order *entity.Order)
 	subscriptionService *subscriptionservice.Service
@@ -90,14 +89,12 @@ func NewMarketDepthWatcher(
 ) *MarketDepthWatcher {
 	// Инициализируем мапы
 	signalsBySymbol := make(map[string][]*Signal)
-	signalsIndexByPrice := make(map[string]map[float64][]*Signal)
 	orderBooks := make(map[string]*OrderBookMap)
 	activeSymbols := make(map[string]bool)
 
 	watcher := &MarketDepthWatcher{
 		client:              nil,
 		signalsBySymbol:     signalsBySymbol,
-		signalsIndexByPrice: signalsIndexByPrice,
 		orderBooks:          orderBooks,
 		activeSymbols:       activeSymbols,
 		mu:                  sync.RWMutex{},
@@ -146,10 +143,6 @@ func (w *MarketDepthWatcher) AddSignal(signal *Signal) {
 	// Добавляем сигнал в список для его символа
 	currentSignals := w.signalsBySymbol[signal.Symbol]
 	w.signalsBySymbol[signal.Symbol] = append(currentSignals, signal)
-	if w.signalsIndexByPrice[signal.Symbol] == nil {
-		w.signalsIndexByPrice[signal.Symbol] = make(map[float64][]*Signal)
-	}
-	w.signalsIndexByPrice[signal.Symbol][signal.TargetPrice] = append(w.signalsIndexByPrice[signal.Symbol][signal.TargetPrice], signal)
 	log.Printf("MarketDepthWatcher: Signal %d added. Total signals for %s: %d",
 		signal.ID, signal.Symbol, len(w.signalsBySymbol[signal.Symbol]))
 
@@ -229,21 +222,6 @@ func (w *MarketDepthWatcher) removeSignalByIDLocked(id int64) {
 			if signal.ID == id {
 				// Удаляем сигнал из слайса
 				w.signalsBySymbol[symbol] = append(signals[:i], signals[i+1:]...)
-				if idx, ok := w.signalsIndexByPrice[symbol]; ok {
-					priceSignals := idx[signal.TargetPrice]
-					for j, s := range priceSignals {
-						if s == signal {
-							idx[signal.TargetPrice] = append(priceSignals[:j], priceSignals[j+1:]...)
-							if len(idx[signal.TargetPrice]) == 0 {
-								delete(idx, signal.TargetPrice)
-							}
-							break
-						}
-					}
-					if len(idx) == 0 {
-						delete(w.signalsIndexByPrice, symbol)
-					}
-				}
 				log.Printf("MarketDepthWatcher: Removed signal %d for symbol %s", id, symbol)
 
 				// Если больше нет сигналов для этого символа - помечаем символ как неактивный
@@ -495,24 +473,6 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	binanceEventTime := time.UnixMilli(data.Data.EventTime)
 	updateStart := time.Now() // время начала обработки обновления
 
-	type depthLevel struct {
-		price float64
-		qty   float64
-	}
-	// Парсим заранее, чтобы не держать лок и не дергать strconv внутри критической секции
-	bids := make([]depthLevel, 0, len(data.Data.Bids))
-	for _, bidUpdate := range data.Data.Bids {
-		price, _ := strconv.ParseFloat(bidUpdate[0], 64)
-		qty, _ := strconv.ParseFloat(bidUpdate[1], 64)
-		bids = append(bids, depthLevel{price: price, qty: qty})
-	}
-	asks := make([]depthLevel, 0, len(data.Data.Asks))
-	for _, askUpdate := range data.Data.Asks {
-		price, _ := strconv.ParseFloat(askUpdate[0], 64)
-		qty, _ := strconv.ParseFloat(askUpdate[1], 64)
-		asks = append(asks, depthLevel{price: price, qty: qty})
-	}
-
 	w.mu.RLock()
 	// Проверяем, активен ли символ и есть ли сигналы
 	signalsCount := len(w.signalsBySymbol[symbol])
@@ -525,7 +485,12 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		return
 	}
 
+	// Обрабатываем сигналы для символа
+	var signalsToRemove []int64
+
 	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	w.lastActivityTime = time.Now()
 
 	// Получаем или создаём локальный стакан для символа
@@ -540,78 +505,40 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		log.Printf("MarketDepthWatcher: Created new orderbook for symbol %s during update processing", symbol)
 	}
 
-	for _, bid := range bids {
-		if bid.qty == 0 {
-			delete(ob.Bids, bid.price)
+	// Обновляем bids
+	for _, bidUpdate := range data.Data.Bids {
+		price, _ := strconv.ParseFloat(bidUpdate[0], 64)
+		qty, _ := strconv.ParseFloat(bidUpdate[1], 64)
+		if qty == 0 {
+			delete(ob.Bids, price)
 		} else {
-			ob.Bids[bid.price] = bid.qty
+			ob.Bids[price] = qty
 		}
 	}
 
-	for _, ask := range asks {
-		if ask.qty == 0 {
-			delete(ob.Asks, ask.price)
+	// Обновляем asks
+	for _, askUpdate := range data.Data.Asks {
+		price, _ := strconv.ParseFloat(askUpdate[0], 64)
+		qty, _ := strconv.ParseFloat(askUpdate[1], 64)
+		if qty == 0 {
+			delete(ob.Asks, price)
 		} else {
-			ob.Asks[ask.price] = ask.qty
+			ob.Asks[price] = qty
 		}
 	}
 
 	ob.LastUpdateID = data.Data.LastUpdateID
 	ob.LastUpdateTime = time.Now()
 
+	// Обрабатываем сигналы
 	signalsForSymbol, ok := w.signalsBySymbol[symbol]
 	if !ok {
-		w.mu.Unlock()
 		log.Printf("MarketDepthWatcher: No signals found for symbol %s", symbol)
 		return
 	}
 
-	// Снимок сигналов и qty по ценам под одной блокировкой
-	signalsSnapshot := append([]*Signal(nil), signalsForSymbol...)
-	priceQty := make(map[float64]struct {
-		bid float64
-		ask float64
-	})
-	if byPrice := w.signalsIndexByPrice[symbol]; byPrice != nil {
-		for price := range byPrice {
-			priceQty[price] = struct {
-				bid float64
-				ask float64
-			}{
-				bid: ob.Bids[price],
-				ask: ob.Asks[price],
-			}
-		}
-	}
-	w.mu.Unlock()
-
-	var signalsToRemove []int64
-	lastQtyUpdates := make(map[int64]float64)
-
-	for _, signal := range signalsSnapshot {
-		pq := priceQty[signal.TargetPrice]
-		currentQty := 0.0
-		found := false
-		switch signal.OriginalSide {
-		case "BUY":
-			if pq.bid > 0 {
-				found = true
-				currentQty = pq.bid
-			}
-		case "SELL":
-			if pq.ask > 0 {
-				found = true
-				currentQty = pq.ask
-			}
-		default:
-			if pq.bid > 0 {
-				found = true
-				currentQty = pq.bid
-			} else if pq.ask > 0 {
-				found = true
-				currentQty = pq.ask
-			}
-		}
+	for _, signal := range signalsForSymbol {
+		found, currentQty := w.findOrderAtPrice(ob, signal.TargetPrice)
 		// Проверка на отмену
 		if signal.TriggerOnCancel {
 			if !found && signal.OriginalQty > 0 {
@@ -692,31 +619,20 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 				log.Printf("MarketDepthWatcher: Signal %d: Order quantity updated: %.4f -> %.4f (change: %.4f)",
 					signal.ID, signal.LastQty, currentQty, change)
 			}
-			lastQtyUpdates[signal.ID] = currentQty
+			signal.LastQty = currentQty
 		} else {
 			// Если заявка не найдена, но была найдена ранее, устанавливаем 0
 			if signal.LastQty > 0 {
 				log.Printf("MarketDepthWatcher: Signal %d: Order disappeared, setting LastQty to 0", signal.ID)
-				lastQtyUpdates[signal.ID] = 0
+				signal.LastQty = 0
 			}
 		}
 	}
 
 	// Удаляем все сработавшие сигналы
-	if len(signalsToRemove) > 0 || len(lastQtyUpdates) > 0 {
-		w.mu.Lock()
-		if signalsLive, ok := w.signalsBySymbol[symbol]; ok {
-			for _, sig := range signalsLive {
-				if qty, ok := lastQtyUpdates[sig.ID]; ok {
-					sig.LastQty = qty
-				}
-			}
-		}
-		for _, id := range signalsToRemove {
-			log.Printf("MarketDepthWatcher: Removing triggered signal %d immediately after trigger", id)
-			w.removeSignalByIDLocked(id)
-		}
-		w.mu.Unlock()
+	for _, id := range signalsToRemove {
+		log.Printf("MarketDepthWatcher: Removing triggered signal %d immediately after trigger", id)
+		w.removeSignalByIDLocked(id)
 	}
 
 	// Проверяем, остались ли у пользователя активные сигналы после срабатывания триггера
@@ -743,7 +659,6 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 
 // 🔥 НОВЫЙ МЕТОД: удаление сигнала по ID с полной очисткой ресурсов
 func (w *MarketDepthWatcher) removeSignalByID(id int64) {
-	removed := false
 	for symbol, signals := range w.signalsBySymbol {
 		for i, signal := range signals {
 			if signal.ID == id {
@@ -765,33 +680,27 @@ func (w *MarketDepthWatcher) removeSignalByID(id int64) {
 						}
 					}
 				}()
-				// Если больше нет сигналов для этого символа - очищаем ресурсы
-				if len(w.signalsBySymbol[symbol]) == 0 {
-					delete(w.signalsBySymbol, symbol)
-					delete(w.activeSymbols, symbol)
-					delete(w.orderBooks, symbol)
-					log.Printf("MarketDepthWatcher: All resources cleaned up for symbol %s after last signal removal", symbol)
-
-					// Если это был последний символ - останавливаем WebSocket
-					if len(w.activeSymbols) == 0 && w.client != nil {
-						log.Printf("MarketDepthWatcher: No active symbols left, closing WebSocket connection")
-						w.client.Close()
-						w.client = nil
-						w.started = false
-					}
-				}
-				removed = true
-				break
 			}
-		}
-		if removed {
-			break
+			// Если больше нет сигналов для этого символа - очищаем ресурсы
+			if len(w.signalsBySymbol[symbol]) == 0 {
+				delete(w.signalsBySymbol, symbol)
+				delete(w.activeSymbols, symbol)
+				delete(w.orderBooks, symbol)
+				log.Printf("MarketDepthWatcher: All resources cleaned up for symbol %s after last signal removal", symbol)
+
+				// Если это был последний символ - останавливаем WebSocket
+				if len(w.activeSymbols) == 0 && w.client != nil {
+					log.Printf("MarketDepthWatcher: No active symbols left, closing WebSocket connection")
+					w.client.Close()
+					w.client = nil
+					w.started = false
+				}
+			}
+			return
 		}
 	}
 
-	if !removed {
-		log.Printf("MarketDepthWatcher: Signal %d not found for removal", id)
-	}
+	log.Printf("MarketDepthWatcher: Signal %d not found for removal", id)
 }
 
 // findOrderAtPrice ищет заявку в локальном OrderBookMap по точному совпадению цены
@@ -929,7 +838,6 @@ func (w *MarketDepthWatcher) RemoveAllSignalsForSymbol(symbol string) {
 		for _, sig := range signals {
 			w.removeSignalByIDLocked(sig.ID)
 		}
-		delete(w.signalsIndexByPrice, symbol)
 	} else {
 		log.Printf("MarketDepthWatcher: No signals found for symbol %s to remove", symbol)
 	}
