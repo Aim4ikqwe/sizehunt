@@ -52,16 +52,18 @@ type OKXPositionData struct {
 
 // PositionWatcher отслеживает позиции пользователя через WebSocket
 type PositionWatcher struct {
-	positions  map[string]*Position // instId -> Position
-	mu         sync.RWMutex
-	wsConn     *websocket.Conn
-	ctx        context.Context
-	cancel     context.CancelFunc
-	apiKey     string
-	secretKey  string
-	passphrase string
-	isRunning  bool
-	signalRepo repository.SignalRepository
+	positions    map[string]*Position // instId -> Position
+	mu           sync.RWMutex
+	wsConn       *websocket.Conn
+	ctx          context.Context
+	cancel       context.CancelFunc
+	apiKey       string
+	secretKey    string
+	passphrase   string
+	isRunning    bool
+	signalRepo   repository.SignalRepository
+	websocketMgr *WebSocketManager // для вызова GracefulStopProxyForUser
+	userID       int64             // ID пользователя для связи с WebSocketManager
 }
 
 // NewPositionWatcher создает новый PositionWatcher
@@ -77,6 +79,20 @@ func NewPositionWatcher(ctx context.Context, apiKey, secretKey, passphrase strin
 		isRunning:  false,
 		signalRepo: signalRepo,
 	}
+}
+
+// SetWebSocketManager устанавливает ссылку на WebSocketManager
+func (pw *PositionWatcher) SetWebSocketManager(wsm *WebSocketManager) {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	pw.websocketMgr = wsm
+}
+
+// SetUserID устанавливает ID пользователя
+func (pw *PositionWatcher) SetUserID(userID int64) {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	pw.userID = userID
 }
 
 // Start запускает PositionWatcher с подключением к приватному WebSocket
@@ -421,9 +437,12 @@ func (pw *PositionWatcher) checkAndRemoveSignalsIfZeroPosition(instID string) {
 
 	// Фильтруем сигналы по instID
 	var signalsForInst []*repository.SignalDB
+	var userIDs []int64 // для отслеживания ID пользователей, у которых были сигналы
 	for _, signal := range allSignals {
 		if signal.InstID == instID {
 			signalsForInst = append(signalsForInst, signal)
+			// Сохраняем ID пользователя, чтобы вызвать остановку прокси позже
+			userIDs = append(userIDs, signal.UserID)
 		}
 	}
 
@@ -439,6 +458,20 @@ func (pw *PositionWatcher) checkAndRemoveSignalsIfZeroPosition(instID string) {
 			}
 
 			log.Printf("OKXPositionWatcher: Signal %d for instID %s has been deactivated because position is 0", signal.ID, instID)
+
+			// Удаляем сигнал из памяти MarketDepthWatcher
+			if pw.websocketMgr != nil {
+				log.Printf("OKXPositionWatcher: Removing signal %d from memory for user %d", signal.ID, signal.UserID)
+				pw.websocketMgr.RemoveSignalFromMemory(signal.UserID, signal.ID)
+			}
+		}
+	}
+
+	// После деактивации сигналов, проверяем, нужно ли остановить прокси для пользователей
+	for _, userID := range userIDs {
+		if pw.websocketMgr != nil {
+			log.Printf("OKXPositionWatcher: Calling GracefulStopProxyForUser for user %d", userID)
+			pw.websocketMgr.GracefulStopProxyForUser(userID)
 		}
 	}
 }

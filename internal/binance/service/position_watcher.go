@@ -17,10 +17,12 @@ import (
 // PositionWatcher stores futures positions updated via WS
 // and provides fast GetPosition() for OrderManager.
 type PositionWatcher struct {
-	mu         sync.RWMutex
-	positions  map[string]float64   // symbol -> amount
-	lastUpdate map[string]time.Time // symbol -> last update time
-	signalRepo repository.SignalRepository
+	mu           sync.RWMutex
+	positions    map[string]float64   // symbol -> amount
+	lastUpdate   map[string]time.Time // symbol -> last update time
+	signalRepo   repository.SignalRepository
+	websocketMgr *WebSocketManager // для вызова GracefulStopProxyForUser
+	userID       int64             // ID пользователя для связи с WebSocketManager
 }
 
 func NewPositionWatcher(signalRepo repository.SignalRepository) *PositionWatcher {
@@ -32,6 +34,20 @@ func NewPositionWatcher(signalRepo repository.SignalRepository) *PositionWatcher
 
 	log.Println("PositionWatcher: Created new instance")
 	return watcher
+}
+
+// SetWebSocketManager устанавливает ссылку на WebSocketManager
+func (w *PositionWatcher) SetWebSocketManager(wsm *WebSocketManager) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.websocketMgr = wsm
+}
+
+// SetUserID устанавливает ID пользователя
+func (w *PositionWatcher) SetUserID(userID int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.userID = userID
 }
 
 // GetPosition returns last cached amount for the symbol
@@ -181,9 +197,12 @@ func (w *PositionWatcher) checkAndRemoveSignalsIfZeroPosition(symbol string) {
 
 	// Фильтруем сигналы по символу
 	var signalsForSymbol []*repository.SignalDB
+	var userIDs []int64 // для отслеживания ID пользователей, у которых были сигналы
 	for _, signal := range allSignals {
 		if signal.Symbol == symbol {
 			signalsForSymbol = append(signalsForSymbol, signal)
+			// Сохраняем ID пользователя, чтобы вызвать остановку прокси позже
+			userIDs = append(userIDs, signal.UserID)
 		}
 	}
 
@@ -199,6 +218,20 @@ func (w *PositionWatcher) checkAndRemoveSignalsIfZeroPosition(symbol string) {
 			}
 
 			log.Printf("PositionWatcher: Signal %d for symbol %s has been deactivated because position is 0", signal.ID, symbol)
+
+			// Удаляем сигнал из памяти MarketDepthWatcher
+			if w.websocketMgr != nil {
+				log.Printf("PositionWatcher: Removing signal %d from memory for user %d", signal.ID, signal.UserID)
+				w.websocketMgr.RemoveSignalFromMemory(signal.UserID, signal.ID)
+			}
+		}
+	}
+
+	// После деактивации сигналов, проверяем, нужно ли остановить прокси для пользователей
+	for _, userID := range userIDs {
+		if w.websocketMgr != nil {
+			log.Printf("PositionWatcher: Calling GracefulStopProxyForUser for user %d", userID)
+			w.websocketMgr.GracefulStopProxyForUser(userID)
 		}
 	}
 }

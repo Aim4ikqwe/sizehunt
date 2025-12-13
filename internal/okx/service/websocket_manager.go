@@ -160,6 +160,10 @@ func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, instID, instT
 		// Создаем PositionWatcher ТОЛЬКО если есть auto-close сигналы
 		if autoClose {
 			positionWatcher = NewPositionWatcher(m.ctx, apiKey, secretKey, passphrase, m.signalRepo)
+			// Устанавливаем ссылку на WebSocketManager
+			positionWatcher.SetWebSocketManager(m)
+			// Устанавливаем ID пользователя
+			positionWatcher.SetUserID(userID)
 
 			// Запускаем PositionWatcher асинхронно
 			go func() {
@@ -218,6 +222,8 @@ func (m *WebSocketManager) ensurePositionWatcher(userWatcher *UserWatcher, userI
 
 	// Создаем и запускаем PositionWatcher
 	positionWatcher := NewPositionWatcher(m.ctx, apiKey, secretKey, passphrase, m.signalRepo)
+	// Устанавливаем ссылку на WebSocketManager
+	positionWatcher.SetWebSocketManager(m)
 	userWatcher.positionWatcher = positionWatcher
 	if userWatcher.watcher != nil {
 		userWatcher.watcher.positionWatcher = positionWatcher
@@ -396,6 +402,23 @@ func (m *WebSocketManager) GetProxyAddressForUser(userID int64) (string, bool) {
 		return m.proxyService.GetProxyAddressForUser(userID)
 	}
 	return "", false
+}
+
+// RemoveSignalFromMemory удаляет сигнал из памяти MarketDepthWatcher
+func (m *WebSocketManager) RemoveSignalFromMemory(userID int64, signalID int64) {
+	log.Printf("OKXWebSocketManager: Removing signal %d from memory for user %d", signalID, userID)
+
+	m.mu.RLock()
+	userWatcher, exists := m.userWatchers[userID]
+	m.mu.RUnlock()
+
+	if !exists || userWatcher == nil || userWatcher.watcher == nil {
+		log.Printf("OKXWebSocketManager: No UserWatcher or MarketDepthWatcher found for user %d", userID)
+		return
+	}
+
+	// Удаляем сигнал из MarketDepthWatcher
+	userWatcher.watcher.RemoveSignal(signalID)
 }
 
 // GracefulStopProxyForUser обеспечивает плавную остановку прокси и WebSocket соединений для пользователя

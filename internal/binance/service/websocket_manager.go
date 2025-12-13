@@ -252,6 +252,10 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 				binanceClient := NewBinanceHTTPClientWithProxy(apiKey, secretKey, proxyAddr, m.cfg)
 				uw.futuresClient = binanceClient.FuturesClient
 				uw.positionWatcher = NewPositionWatcher(m.signalRepo)
+				// Устанавливаем ссылку на WebSocketManager
+				uw.positionWatcher.SetWebSocketManager(m)
+				// Устанавливаем ID пользователя
+				uw.positionWatcher.SetUserID(userID)
 				uw.userDataStream = NewUserDataStream(uw.futuresClient, uw.positionWatcher, m.proxyService, userID)
 				// Инициализируем позиции
 				go func() {
@@ -323,6 +327,8 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 				binanceClient := NewBinanceHTTPClientWithProxy(apiKey, secretKey, proxyAddr, m.cfg)
 				uw.futuresClient = binanceClient.FuturesClient
 				uw.positionWatcher = NewPositionWatcher(m.signalRepo)
+				// Устанавливаем ссылку на WebSocketManager
+				uw.positionWatcher.SetWebSocketManager(m)
 				uw.userDataStream = NewUserDataStream(uw.futuresClient, uw.positionWatcher, m.proxyService, userID)
 				// Инициализируем позиции
 				go func() {
@@ -1046,6 +1052,40 @@ func (m *WebSocketManager) GetProxyAddressForUser(userID int64) (string, bool) {
 		return m.proxyService.GetProxyAddressForUser(userID)
 	}
 	return "", false
+}
+
+// RemoveSignalFromMemory удаляет сигнал из памяти MarketDepthWatcher
+func (m *WebSocketManager) RemoveSignalFromMemory(userID int64, signalID int64) {
+	log.Printf("WebSocketManager: Removing signal %d from memory for user %d", signalID, userID)
+
+	m.mu.RLock()
+	uw, exists := m.userWatchers[userID]
+	m.mu.RUnlock()
+
+	if !exists || uw == nil {
+		log.Printf("WebSocketManager: No UserWatcher found for user %d", userID)
+		return
+	}
+
+	// Ищем сигнал в spot и futures watcher'ах и удаляем его
+	uw.mu.Lock()
+	defer uw.mu.Unlock()
+
+	// Проверяем spot watcher'ы
+	for symbol, watcher := range uw.spotWatchers {
+		if watcher.HasSignal(signalID) {
+			log.Printf("WebSocketManager: Found signal %d in spot watcher for symbol %s, removing", signalID, symbol)
+			watcher.RemoveSignal(signalID)
+		}
+	}
+
+	// Проверяем futures watcher'ы
+	for symbol, watcher := range uw.futuresWatchers {
+		if watcher.HasSignal(signalID) {
+			log.Printf("WebSocketManager: Found signal %d in futures watcher for symbol %s, removing", signalID, symbol)
+			watcher.RemoveSignal(signalID)
+		}
+	}
 }
 
 // GracefulStopProxyForUser обеспечивает плавную остановку прокси для пользователя
