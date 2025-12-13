@@ -29,6 +29,7 @@ func NewOrderManager(futuresClient *futures.Client, watcher *PositionWatcher) *O
 // CloseFullPosition closes position using cached WS data for specific user only
 func (om *OrderManager) CloseFullPosition(symbol string) error {
 	startTime := time.Now()
+	log.Printf("OrderManager: Starting CloseFullPosition for %s at %v", symbol, startTime)
 	defer func() {
 		log.Printf("OrderManager: CloseFullPosition for %s completed (total time: %v)", symbol, time.Since(startTime))
 	}()
@@ -61,6 +62,7 @@ func (om *OrderManager) CloseFullPosition(symbol string) error {
 		NewOrderResponseType(futures.NewOrderRespTypeRESULT) // Получаем подробный ответ
 
 	orderStartTime := time.Now()
+	log.Printf("OrderManager: Sending close order for %s at %v", symbol, orderStartTime)
 	// FIX: Use correct response type - *futures.CreateOrderResponse instead of *futures.Order
 	resp, err := svc.Do(context.Background())
 	orderDuration := time.Since(orderStartTime)

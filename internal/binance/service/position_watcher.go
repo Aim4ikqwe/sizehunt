@@ -80,8 +80,9 @@ func (w *PositionWatcher) GetPositionWithTimestamp(symbol string) (float64, time
 // setPosition updates cache
 func (w *PositionWatcher) setPosition(symbol string, amt float64) {
 	startTime := time.Now()
+	log.Printf("PositionWatcher: Starting setPosition for %s at %v", symbol, startTime)
 	defer func() {
-		log.Printf("PositionWatcher: setPosition for %s took %v", symbol, time.Since(startTime))
+		log.Printf("PositionWatcher: setPosition for %s completed (total time: %v)", symbol, time.Since(startTime))
 	}()
 
 	w.mu.Lock()
@@ -91,6 +92,7 @@ func (w *PositionWatcher) setPosition(symbol string, amt float64) {
 	w.lastUpdate[symbol] = time.Now()
 
 	if amt == 0 {
+		log.Printf("PositionWatcher: Position for %s is zero, scheduling signal removal", symbol)
 		go w.checkAndRemoveSignalsIfZeroPosition(symbol)
 	}
 }

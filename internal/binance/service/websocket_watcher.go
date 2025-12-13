@@ -60,7 +60,7 @@ type MarketDepthWatcher struct {
 	subscriptionService *subscriptionservice.Service
 	keysRepo            *binance_repository.PostgresKeysRepo
 	config              *config.Config
-	activeSymbols       map[string]bool // символы, за которыми мы сейчас следим
+	activeSymbols       map[string]bool // символы, за которых мы сейчас следим
 	market              string          // "spot" или "futures"
 	ctx                 context.Context // Контекст для всего watcher'а
 	started             bool            // Флаг, указывающий, был ли запущен watcher
@@ -72,6 +72,7 @@ type MarketDepthWatcher struct {
 	signalRepository    binance_repository.SignalRepository
 	WebSocketManager    *WebSocketManager
 	UserID              int64
+	timeSyncService     *TimeSyncService // сервис синхронизации времени
 }
 
 func NewMarketDepthWatcher(
@@ -113,6 +114,7 @@ func NewMarketDepthWatcher(
 		signalRepository:    signalRepo,
 		WebSocketManager:    wsManager,
 		UserID:              userID,
+		timeSyncService:     NewTimeSyncService(futuresClient),
 	}
 
 	log.Printf("MarketDepthWatcher: Created new watcher for market %s (creation time: %v)", market, watcher.creationTime)
@@ -473,6 +475,11 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	binanceEventTime := time.UnixMilli(data.Data.EventTime)
 	updateStart := time.Now() // время начала обработки обновления
 
+	// Применяем коррекцию времени к binanceEventTime
+	if w.timeSyncService != nil {
+		binanceEventTime = w.timeSyncService.CorrectTimestamp(binanceEventTime)
+	}
+
 	w.mu.RLock()
 	// Проверяем, активен ли символ и есть ли сигналы
 	signalsCount := len(w.signalsBySymbol[symbol])
@@ -727,6 +734,7 @@ func (w *MarketDepthWatcher) findOrderAtPrice(ob *OrderBookMap, targetPrice floa
 
 func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order) {
 	startTime := time.Now()
+	log.Printf("MarketDepthWatcher: Starting handleAutoClose for signal %d at %v", signal.ID, startTime)
 	defer func() {
 		log.Printf("MarketDepthWatcher: handleAutoClose for signal %d completed (total time: %v)",
 			signal.ID, time.Since(startTime))
@@ -743,8 +751,10 @@ func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order
 		return
 	}
 
-	log.Printf("MarketDepthWatcher: handleAutoClose called for signal %d, user %d, symbol %s",
-		signal.ID, signal.UserID, signal.Symbol)
+	// Вычисляем задержку между событием на бирже и вызовом закрытия
+	latency := time.Since(signal.BinanceEventTime)
+	log.Printf("MarketDepthWatcher: handleAutoClose called for signal %d, user %d, symbol %s (latency since binance event: %v)",
+		signal.ID, signal.UserID, signal.Symbol, latency)
 
 	// Проверка подписки (остаётся)
 	subscribed, err := w.subscriptionService.IsUserSubscribed(context.Background(), signal.UserID)
