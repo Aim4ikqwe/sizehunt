@@ -2,11 +2,14 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"strconv"
 	"sync"
 	"time"
+
+	"sizehunt/internal/binance/repository"
 
 	"github.com/adshao/go-binance/v2/futures"
 )
@@ -17,12 +20,14 @@ type PositionWatcher struct {
 	mu         sync.RWMutex
 	positions  map[string]float64   // symbol -> amount
 	lastUpdate map[string]time.Time // symbol -> last update time
+	signalRepo repository.SignalRepository
 }
 
-func NewPositionWatcher() *PositionWatcher {
+func NewPositionWatcher(signalRepo repository.SignalRepository) *PositionWatcher {
 	watcher := &PositionWatcher{
 		positions:  make(map[string]float64),
 		lastUpdate: make(map[string]time.Time),
+		signalRepo: signalRepo,
 	}
 
 	log.Println("PositionWatcher: Created new instance")
@@ -69,6 +74,9 @@ func (w *PositionWatcher) setPosition(symbol string, amt float64) {
 	w.positions[symbol] = amt
 	w.lastUpdate[symbol] = time.Now()
 
+	if amt == 0 {
+		go w.checkAndRemoveSignalsIfZeroPosition(symbol)
+	}
 }
 
 // HandleWsEvent parses WsUserDataEvent and extracts futures account updates
@@ -143,7 +151,7 @@ func (w *PositionWatcher) HandleWsEvent(e *futures.WsUserDataEvent) {
 		log.Printf("  Current amount: %.6f", amt)
 		log.Printf("  Previous amount: %.6f", oldAmt)
 		log.Printf("  Change: %.6f", change)
-		log.Printf("  Entry price: %.8f", entryPrice)
+		log.Printf(" Entry price: %.8f", entryPrice)
 		log.Printf("  Mark price: %.8f", markPrice)
 		log.Printf("  Unrealized PnL: %.8f", unrealizedProfit)
 
@@ -151,4 +159,46 @@ func (w *PositionWatcher) HandleWsEvent(e *futures.WsUserDataEvent) {
 	}
 
 	log.Printf("PositionWatcher: Event processing completed successfully")
+}
+
+// checkAndRemoveSignalsIfZeroPosition проверяет и удаляет сигналы, если позиция равна 0
+func (w *PositionWatcher) checkAndRemoveSignalsIfZeroPosition(symbol string) {
+	if w.signalRepo == nil {
+		log.Printf("PositionWatcher: Signal repository is nil, skipping signal removal for %s", symbol)
+		return
+	}
+
+	ctx := context.Background()
+
+	// Получаем все активные сигналы из базы данных
+	allSignals, err := w.signalRepo.GetAllActiveSignals(ctx)
+	if err != nil {
+		log.Printf("PositionWatcher: ERROR: Failed to get all active signals: %v", err)
+		return
+	}
+
+	log.Printf("PositionWatcher: Found %d active signals in total, checking for symbol %s", len(allSignals), symbol)
+
+	// Фильтруем сигналы по символу
+	var signalsForSymbol []*repository.SignalDB
+	for _, signal := range allSignals {
+		if signal.Symbol == symbol {
+			signalsForSymbol = append(signalsForSymbol, signal)
+		}
+	}
+
+	log.Printf("PositionWatcher: Found %d active signals for symbol %s, checking for removal", len(signalsForSymbol), symbol)
+
+	for _, signal := range signalsForSymbol {
+		// Проверяем, что позиция действительно равна 0
+		if w.GetPosition(symbol) == 0 {
+			// Деактивируем сигнал в базе данных
+			if err := w.signalRepo.Deactivate(ctx, signal.ID); err != nil {
+				log.Printf("PositionWatcher: ERROR: Failed to deactivate signal %d: %v", signal.ID, err)
+				continue
+			}
+
+			log.Printf("PositionWatcher: Signal %d for symbol %s has been deactivated because position is 0", signal.ID, symbol)
+		}
+	}
 }

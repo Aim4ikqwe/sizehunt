@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sizehunt/internal/okx/repository"
 	"strconv"
 	"sync"
 	"time"
@@ -60,10 +61,11 @@ type PositionWatcher struct {
 	secretKey  string
 	passphrase string
 	isRunning  bool
+	signalRepo repository.SignalRepository
 }
 
 // NewPositionWatcher создает новый PositionWatcher
-func NewPositionWatcher(ctx context.Context, apiKey, secretKey, passphrase string) *PositionWatcher {
+func NewPositionWatcher(ctx context.Context, apiKey, secretKey, passphrase string, signalRepo repository.SignalRepository) *PositionWatcher {
 	childCtx, cancel := context.WithCancel(ctx)
 	return &PositionWatcher{
 		positions:  make(map[string]*Position),
@@ -73,6 +75,7 @@ func NewPositionWatcher(ctx context.Context, apiKey, secretKey, passphrase strin
 		secretKey:  secretKey,
 		passphrase: passphrase,
 		isRunning:  false,
+		signalRepo: signalRepo,
 	}
 }
 
@@ -289,10 +292,17 @@ func (pw *PositionWatcher) updatePositions(data *OKXPositionData) {
 			LastUpdate:  time.Now(),
 		}
 
+		// Проверяем, является ли позиция новой нулевой или только что стала нулевой
+		oldPosition, exists := pw.positions[posData.InstID]
 		pw.positions[posData.InstID] = position
 
 		log.Printf("OKXPositionWatcher: Position updated for %s: pos=%.6f, side=%s, pnl=%.2f",
 			posData.InstID, pos, posData.PosSide, upl)
+
+		// Если позиция стала равной 0, проверяем и удаляем связанные сигналы
+		if pos == 0 && exists && oldPosition.Pos != 0 {
+			go pw.checkAndRemoveSignalsIfZeroPosition(posData.InstID)
+		}
 	}
 }
 
@@ -388,4 +398,47 @@ func (pw *PositionWatcher) IsRunning() bool {
 	pw.mu.RLock()
 	defer pw.mu.RUnlock()
 	return pw.isRunning
+}
+
+// checkAndRemoveSignalsIfZeroPosition проверяет и удаляет сигналы, если позиция равна 0
+func (pw *PositionWatcher) checkAndRemoveSignalsIfZeroPosition(instID string) {
+	if pw.signalRepo == nil {
+		log.Printf("OKXPositionWatcher: Signal repository is nil, skipping signal removal for %s", instID)
+		return
+	}
+
+	ctx := context.Background()
+
+	// В OKX PositionWatcher связан с конкретным пользователем, но мы не можем напрямую получить userID
+	// Вместо этого, получаем все активные сигналы и фильтруем по instID
+	allSignals, err := pw.signalRepo.GetAllActiveSignals(ctx)
+	if err != nil {
+		log.Printf("OKXPositionWatcher: ERROR: Failed to get all active signals: %v", err)
+		return
+	}
+
+	log.Printf("OKXPositionWatcher: Found %d total active signals, checking for instID %s", len(allSignals), instID)
+
+	// Фильтруем сигналы по instID
+	var signalsForInst []*repository.SignalDB
+	for _, signal := range allSignals {
+		if signal.InstID == instID {
+			signalsForInst = append(signalsForInst, signal)
+		}
+	}
+
+	log.Printf("OKXPositionWatcher: Found %d active signals for instID %s, checking for removal", len(signalsForInst), instID)
+
+	for _, signal := range signalsForInst {
+		// Проверяем, что позиция действительно равна 0
+		if pos, exists := pw.GetPosition(instID); exists && pos.Pos == 0 {
+			// Деактивируем сигнал в базе данных
+			if err := pw.signalRepo.Deactivate(ctx, signal.ID); err != nil {
+				log.Printf("OKXPositionWatcher: ERROR: Failed to deactivate signal %d: %v", signal.ID, err)
+				continue
+			}
+
+			log.Printf("OKXPositionWatcher: Signal %d for instID %s has been deactivated because position is 0", signal.ID, instID)
+		}
+	}
 }

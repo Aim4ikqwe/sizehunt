@@ -159,7 +159,7 @@ func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, instID, instT
 
 		// Создаем PositionWatcher ТОЛЬКО если есть auto-close сигналы
 		if autoClose {
-			positionWatcher = NewPositionWatcher(m.ctx, apiKey, secretKey, passphrase)
+			positionWatcher = NewPositionWatcher(m.ctx, apiKey, secretKey, passphrase, m.signalRepo)
 
 			// Запускаем PositionWatcher асинхронно
 			go func() {
@@ -217,7 +217,7 @@ func (m *WebSocketManager) ensurePositionWatcher(userWatcher *UserWatcher, userI
 	}
 
 	// Создаем и запускаем PositionWatcher
-	positionWatcher := NewPositionWatcher(m.ctx, apiKey, secretKey, passphrase)
+	positionWatcher := NewPositionWatcher(m.ctx, apiKey, secretKey, passphrase, m.signalRepo)
 	userWatcher.positionWatcher = positionWatcher
 	if userWatcher.watcher != nil {
 		userWatcher.watcher.positionWatcher = positionWatcher
@@ -270,24 +270,63 @@ func (m *WebSocketManager) GetUserSignals(userID int64) []SignalResponse {
 	var signals []SignalResponse
 
 	if exists && userWatcher.watcher != nil {
+		// Получаем активные сигналы из базы данных для фильтрации
+		activeSignalIDs := make(map[int64]bool)
+		activeSignals, err := m.signalRepo.GetActiveByUserID(context.Background(), userID)
+		if err != nil {
+			log.Printf("OKXWebSocketManager: ERROR: Failed to get active signals from DB for user %d: %v", userID, err)
+			// В случае ошибки возвращаем сигналы из кэша без фильтрации
+			userWatcher.watcher.mu.RLock()
+			for _, signalsForInst := range userWatcher.watcher.signalsByInstID {
+				for _, signal := range signalsForInst {
+					signals = append(signals, SignalResponse{
+						ID:              signal.ID,
+						InstID:          signal.InstID,
+						InstType:        signal.InstType,
+						TargetPrice:     signal.TargetPrice,
+						MinQuantity:     signal.MinQuantity,
+						TriggerOnCancel: signal.TriggerOnCancel,
+						TriggerOnEat:    signal.TriggerOnEat,
+						EatPercentage:   signal.EatPercentage,
+						OriginalQty:     signal.OriginalQty,
+						LastQty:         signal.LastQty,
+						AutoClose:       signal.AutoClose,
+						OriginalSide:    signal.OriginalSide,
+						CreatedAt:       signal.CreatedAt,
+					})
+				}
+			}
+			userWatcher.watcher.mu.RUnlock()
+			return signals
+		}
+
+		// Создаем мапу активных ID для быстрой проверки
+		for _, signal := range activeSignals {
+			activeSignalIDs[signal.ID] = true
+		}
+
+		// Фильтруем сигналы из кэша, оставляя только активные
 		userWatcher.watcher.mu.RLock()
 		for _, signalsForInst := range userWatcher.watcher.signalsByInstID {
 			for _, signal := range signalsForInst {
-				signals = append(signals, SignalResponse{
-					ID:              signal.ID,
-					InstID:          signal.InstID,
-					InstType:        signal.InstType,
-					TargetPrice:     signal.TargetPrice,
-					MinQuantity:     signal.MinQuantity,
-					TriggerOnCancel: signal.TriggerOnCancel,
-					TriggerOnEat:    signal.TriggerOnEat,
-					EatPercentage:   signal.EatPercentage,
-					OriginalQty:     signal.OriginalQty,
-					LastQty:         signal.LastQty,
-					AutoClose:       signal.AutoClose,
-					OriginalSide:    signal.OriginalSide,
-					CreatedAt:       signal.CreatedAt,
-				})
+				// Проверяем, что сигнал принадлежит пользователю и активен в базе данных
+				if signal.UserID == userID && activeSignalIDs[signal.ID] {
+					signals = append(signals, SignalResponse{
+						ID:              signal.ID,
+						InstID:          signal.InstID,
+						InstType:        signal.InstType,
+						TargetPrice:     signal.TargetPrice,
+						MinQuantity:     signal.MinQuantity,
+						TriggerOnCancel: signal.TriggerOnCancel,
+						TriggerOnEat:    signal.TriggerOnEat,
+						EatPercentage:   signal.EatPercentage,
+						OriginalQty:     signal.OriginalQty,
+						LastQty:         signal.LastQty,
+						AutoClose:       signal.AutoClose,
+						OriginalSide:    signal.OriginalSide,
+						CreatedAt:       signal.CreatedAt,
+					})
+				}
 			}
 		}
 		userWatcher.watcher.mu.RUnlock()

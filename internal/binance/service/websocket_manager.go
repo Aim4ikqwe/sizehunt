@@ -251,7 +251,7 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 				// Создаем Binance HTTP клиент с прокси
 				binanceClient := NewBinanceHTTPClientWithProxy(apiKey, secretKey, proxyAddr, m.cfg)
 				uw.futuresClient = binanceClient.FuturesClient
-				uw.positionWatcher = NewPositionWatcher()
+				uw.positionWatcher = NewPositionWatcher(m.signalRepo)
 				uw.userDataStream = NewUserDataStream(uw.futuresClient, uw.positionWatcher, m.proxyService, userID)
 				// Инициализируем позиции
 				go func() {
@@ -322,7 +322,7 @@ func (m *WebSocketManager) createWatcherForUser(userID int64, symbol, market str
 				// Создаем Binance HTTP клиент с прокси
 				binanceClient := NewBinanceHTTPClientWithProxy(apiKey, secretKey, proxyAddr, m.cfg)
 				uw.futuresClient = binanceClient.FuturesClient
-				uw.positionWatcher = NewPositionWatcher()
+				uw.positionWatcher = NewPositionWatcher(m.signalRepo)
 				uw.userDataStream = NewUserDataStream(uw.futuresClient, uw.positionWatcher, m.proxyService, userID)
 				// Инициализируем позиции
 				go func() {
@@ -570,10 +570,31 @@ func (m *WebSocketManager) GetUserSignals(userID int64) []SignalResponse {
 	}
 	uw.mu.Unlock()
 
-	// Конвертируем в ответ без блокировки
+	// Получаем активные сигналы из базы данных для фильтрации
+	activeSignalIDs := make(map[int64]bool)
+	activeSignals, err := m.signalRepo.GetActiveByUserID(context.Background(), userID)
+	if err != nil {
+		log.Printf("WebSocketManager: ERROR: Failed to get active signals from DB for user %d: %v", userID, err)
+		// В случае ошибки возвращаем сигналы из кэша без фильтрации
+		var signals []SignalResponse
+		for _, s := range allSignals {
+			if s.UserID == userID {
+				signals = append(signals, convertSignalToResponse(s))
+			}
+		}
+		metrics.BinanceActiveSignals.WithLabelValues(strconv.FormatInt(userID, 10)).Set(float64(len(signals)))
+		return signals
+	}
+
+	// Создаем мапу активных ID для быстрой проверки
+	for _, signal := range activeSignals {
+		activeSignalIDs[signal.ID] = true
+	}
+
+	// Конвертируем в ответ без блокировки, фильтруя только активные сигналы
 	var signals []SignalResponse
 	for _, s := range allSignals {
-		if s.UserID == userID {
+		if s.UserID == userID && activeSignalIDs[s.ID] {
 			signals = append(signals, convertSignalToResponse(s))
 		}
 	}
