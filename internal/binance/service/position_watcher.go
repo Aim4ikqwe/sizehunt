@@ -186,27 +186,24 @@ func (w *PositionWatcher) checkAndRemoveSignalsIfZeroPosition(symbol string) {
 
 	ctx := context.Background()
 
-	// Получаем все активные сигналы из базы данных
-	allSignals, err := w.signalRepo.GetAllActiveSignals(ctx)
+	// Получаем только активные сигналы конкретного пользователя
+	userSignals, err := w.signalRepo.GetActiveByUserID(ctx, w.userID)
 	if err != nil {
-		log.Printf("PositionWatcher: ERROR: Failed to get all active signals: %v", err)
+		log.Printf("PositionWatcher: ERROR: Failed to get user signals: %v", err)
 		return
 	}
 
-	log.Printf("PositionWatcher: Found %d active signals in total, checking for symbol %s", len(allSignals), symbol)
+	log.Printf("PositionWatcher: Found %d active signals for user %d, checking for symbol %s", len(userSignals), w.userID, symbol)
 
-	// Фильтруем сигналы по символу
+	// Фильтруем сигналы только для конкретного пользователя и символа
 	var signalsForSymbol []*repository.SignalDB
-	var userIDs []int64 // для отслеживания ID пользователей, у которых были сигналы
-	for _, signal := range allSignals {
+	for _, signal := range userSignals {
 		if signal.Symbol == symbol {
 			signalsForSymbol = append(signalsForSymbol, signal)
-			// Сохраняем ID пользователя, чтобы вызвать остановку прокси позже
-			userIDs = append(userIDs, signal.UserID)
 		}
 	}
 
-	log.Printf("PositionWatcher: Found %d active signals for symbol %s, checking for removal", len(signalsForSymbol), symbol)
+	log.Printf("PositionWatcher: Found %d active signals for symbol %s for user %d, checking for removal", len(signalsForSymbol), symbol, w.userID)
 
 	for _, signal := range signalsForSymbol {
 		// Проверяем, что позиция действительно равна 0
@@ -227,11 +224,9 @@ func (w *PositionWatcher) checkAndRemoveSignalsIfZeroPosition(symbol string) {
 		}
 	}
 
-	// После деактивации сигналов, проверяем, нужно ли остановить прокси для пользователей
-	for _, userID := range userIDs {
-		if w.websocketMgr != nil {
-			log.Printf("PositionWatcher: Calling GracefulStopProxyForUser for user %d", userID)
-			w.websocketMgr.GracefulStopProxyForUser(userID)
-		}
+	// После деактивации сигналов, проверяем, нужно ли остановить прокси для текущего пользователя
+	if w.websocketMgr != nil {
+		log.Printf("PositionWatcher: Calling GracefulStopProxyForUser for user %d", w.userID)
+		w.websocketMgr.GracefulStopProxyForUser(w.userID)
 	}
 }

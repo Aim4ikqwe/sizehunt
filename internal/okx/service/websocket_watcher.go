@@ -389,7 +389,7 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	ob.LastSeqID = depthData.SeqID
 	ob.LastUpdateTime = time.Now()
 
-	// Обрабатываем сигналы
+	// Обрабатываем сигналы ТОЛЬКО для текущего пользователя
 	signalsForInst, ok := w.signalsByInstID[instID]
 	if !ok {
 		return
@@ -398,6 +398,11 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	var signalsToRemove []int64
 
 	for _, signal := range signalsForInst {
+		// Убедимся, что сигнал принадлежит текущему пользователю
+		if signal.UserID != w.UserID {
+			continue
+		}
+
 		found, currentQty := w.findOrderAtPrice(ob, signal.TargetPrice)
 
 		// Проверка на отмену

@@ -26,7 +26,7 @@ func NewOrderManager(futuresClient *futures.Client, watcher *PositionWatcher) *O
 	return manager
 }
 
-// CloseFullPosition closes position using cached WS data.
+// CloseFullPosition closes position using cached WS data for specific user only
 func (om *OrderManager) CloseFullPosition(symbol string) error {
 	startTime := time.Now()
 	defer func() {
@@ -77,7 +77,7 @@ func (om *OrderManager) CloseFullPosition(symbol string) error {
 
 	// Асинхронно освежаем позицию после отправки ордера (без блокировки основного потока)
 	go func() {
-		time.Sleep(500 * time.Millisecond) // небольшая пауза, чтобы WS успел принести апдейт
+		time.Sleep(50 * time.Millisecond) // небольшая пауза, чтобы WS успел принести апдейт
 		log.Printf("OrderManager: Forcing position refresh from REST API for %s (post-close)", symbol)
 		if err := om.refreshPositionFromREST(symbol); err != nil {
 			log.Printf("OrderManager: WARNING: Failed to refresh position from REST: %v", err)

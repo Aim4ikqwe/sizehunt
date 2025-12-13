@@ -425,28 +425,24 @@ func (pw *PositionWatcher) checkAndRemoveSignalsIfZeroPosition(instID string) {
 
 	ctx := context.Background()
 
-	// В OKX PositionWatcher связан с конкретным пользователем, но мы не можем напрямую получить userID
-	// Вместо этого, получаем все активные сигналы и фильтруем по instID
-	allSignals, err := pw.signalRepo.GetAllActiveSignals(ctx)
+	// Получаем только активные сигналы конкретного пользователя
+	userSignals, err := pw.signalRepo.GetActiveByUserID(ctx, pw.userID)
 	if err != nil {
-		log.Printf("OKXPositionWatcher: ERROR: Failed to get all active signals: %v", err)
+		log.Printf("OKXPositionWatcher: ERROR: Failed to get user signals: %v", err)
 		return
 	}
 
-	log.Printf("OKXPositionWatcher: Found %d total active signals, checking for instID %s", len(allSignals), instID)
+	log.Printf("OKXPositionWatcher: Found %d active signals for user %d, checking for instID %s", len(userSignals), pw.userID, instID)
 
-	// Фильтруем сигналы по instID
+	// Фильтруем сигналы только для конкретного пользователя инструмента
 	var signalsForInst []*repository.SignalDB
-	var userIDs []int64 // для отслеживания ID пользователей, у которых были сигналы
-	for _, signal := range allSignals {
+	for _, signal := range userSignals {
 		if signal.InstID == instID {
 			signalsForInst = append(signalsForInst, signal)
-			// Сохраняем ID пользователя, чтобы вызвать остановку прокси позже
-			userIDs = append(userIDs, signal.UserID)
 		}
 	}
 
-	log.Printf("OKXPositionWatcher: Found %d active signals for instID %s, checking for removal", len(signalsForInst), instID)
+	log.Printf("OKXPositionWatcher: Found %d active signals for instID %s for user %d, checking for removal", len(signalsForInst), instID, pw.userID)
 
 	for _, signal := range signalsForInst {
 		// Проверяем, что позиция действительно равна 0
@@ -467,11 +463,9 @@ func (pw *PositionWatcher) checkAndRemoveSignalsIfZeroPosition(instID string) {
 		}
 	}
 
-	// После деактивации сигналов, проверяем, нужно ли остановить прокси для пользователей
-	for _, userID := range userIDs {
-		if pw.websocketMgr != nil {
-			log.Printf("OKXPositionWatcher: Calling GracefulStopProxyForUser for user %d", userID)
-			pw.websocketMgr.GracefulStopProxyForUser(userID)
-		}
+	// После деактивации сигналов, проверяем, нужно ли остановить прокси для текущего пользователя
+	if pw.websocketMgr != nil {
+		log.Printf("OKXPositionWatcher: Calling GracefulStopProxyForUser for user %d", pw.userID)
+		pw.websocketMgr.GracefulStopProxyForUser(pw.userID)
 	}
 }

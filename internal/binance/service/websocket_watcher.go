@@ -530,7 +530,7 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	ob.LastUpdateID = data.Data.LastUpdateID
 	ob.LastUpdateTime = time.Now()
 
-	// Обрабатываем сигналы
+	// Обрабатываем сигналы ТОЛЬКО для текущего пользователя
 	signalsForSymbol, ok := w.signalsBySymbol[symbol]
 	if !ok {
 		log.Printf("MarketDepthWatcher: No signals found for symbol %s", symbol)
@@ -538,6 +538,11 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	}
 
 	for _, signal := range signalsForSymbol {
+		// Убедимся, что сигнал принадлежит текущему пользователю
+		if signal.UserID != w.UserID {
+			continue
+		}
+
 		found, currentQty := w.findOrderAtPrice(ob, signal.TargetPrice)
 		// Проверка на отмену
 		if signal.TriggerOnCancel {

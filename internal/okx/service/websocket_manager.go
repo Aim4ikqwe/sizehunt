@@ -73,6 +73,7 @@ func NewWebSocketManager(
 func (m *WebSocketManager) LoadActiveSignals() error {
 	log.Printf("OKXWebSocketManager: Loading active signals from database...")
 
+	// Загружаем все активные сигналы (в оригинальной архитектуре это может быть нужно для начальной инициализации)
 	signals, err := m.signalRepo.GetAllActiveSignals(m.ctx)
 	if err != nil {
 		return err

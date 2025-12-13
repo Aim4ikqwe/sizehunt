@@ -755,6 +755,20 @@ func (h *Handler) DeleteSignal(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Handler: DeleteSignal called for user %d, signal ID %d", userID, signalID)
 
+	// Дополнительная проверка: убедимся, что сигнал принадлежит пользователю
+	signal, err := h.SignalRepository.GetByID(r.Context(), signalID)
+	if err != nil {
+		log.Printf("Handler: ERROR: Failed to get signal %d: %v", signalID, err)
+		http.Error(w, "signal not found", http.StatusNotFound)
+		return
+	}
+
+	if signal.UserID != userID {
+		log.Printf("Handler: ERROR: User %d attempting to delete signal %d that belongs to user %d", userID, signalID, signal.UserID)
+		http.Error(w, "unauthorized: cannot delete another user's signal", http.StatusForbidden)
+		return
+	}
+
 	err = h.WebSocketManager.DeleteUserSignal(userID, signalID)
 	if err != nil {
 		log.Printf("Handler: ERROR: Failed to delete signal %d for user %d: %v", signalID, userID, err)

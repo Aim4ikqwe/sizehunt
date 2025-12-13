@@ -63,7 +63,7 @@ func (s *ProxyService) CheckAndStopProxy(ctx context.Context, userID int64) erro
 	copy(checkers, s.signalCheckers)
 	s.mu.Unlock()
 
-	// Check all registered signal sources
+	// Check all registered signal sources for this specific user only
 	hasActiveSignals := false
 	for _, checker := range checkers {
 		active, err := checker(ctx, userID)
