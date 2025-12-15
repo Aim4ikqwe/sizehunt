@@ -332,6 +332,9 @@ func main() {
 		pr.Get("/api/promocodes", promoCodeHandler.GetAllPromoCodes)
 		pr.Get("/api/promocode/{id}", promoCodeHandler.GetPromoCode)
 		pr.Delete("/api/promocode/{id}", promoCodeHandler.DeletePromoCode)
+
+		// Admin routes
+		pr.Get("/api/user/admin", h.GetAdminStatus)
 	})
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {

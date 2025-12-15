@@ -10,6 +10,7 @@ import (
 	"sizehunt/internal/token"
 	tokenrepository "sizehunt/internal/token/repository"
 	"sizehunt/internal/user/service"
+	"sizehunt/pkg/middleware"
 )
 
 type Handler struct {
@@ -50,6 +51,24 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) GetAdminStatus(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(middleware.UserIDKey).(int64)
+
+	isAdmin, err := h.UserService.IsAdmin(r.Context(), userID)
+	if err != nil {
+		http.Error(w, "Failed to check admin status", http.StatusInternalServerError)
+		return
+	}
+
+	resp := map[string]bool{
+		"is_admin": isAdmin,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(resp)
 }
 
