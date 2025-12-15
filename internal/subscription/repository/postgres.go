@@ -55,3 +55,17 @@ func (r *SubscriptionRepository) Activate(ctx context.Context, txID string) erro
 		txID)
 	return err
 }
+
+func (r *SubscriptionRepository) UpdateExpiresAt(ctx context.Context, userID int64, expiresAt time.Time) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE subscriptions SET expires_at = $1 WHERE user_id = $2 AND status = 'active'`,
+		expiresAt, userID)
+	return err
+}
+
+func (r *SubscriptionRepository) CreateActive(ctx context.Context, userID int64, expiresAt time.Time) error {
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO subscriptions (user_id, status, expires_at) VALUES ($1, 'active', $2)`,
+		userID, expiresAt)
+	return err
+}

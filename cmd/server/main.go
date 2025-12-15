@@ -31,6 +31,9 @@ import (
 	okx_repository "sizehunt/internal/okx/repository"
 	okx_service "sizehunt/internal/okx/service"
 	okxhttp "sizehunt/internal/okx/transport/http"
+	promocoderepo "sizehunt/internal/promocode/repository"
+	promocodeservice "sizehunt/internal/promocode/service"
+	promocodehttp "sizehunt/internal/promocode/transport/http"
 	subscriptionrepository "sizehunt/internal/subscription/repository"
 	subscriptionservice "sizehunt/internal/subscription/service"
 	subscriptionhttp "sizehunt/internal/subscription/transport/http"
@@ -160,6 +163,11 @@ func main() {
 	binanceWatcher := binance_service.NewWatcher(binanceClient)
 	subRepo := subscriptionrepository.NewSubscriptionRepository(database)
 	subService := subscriptionservice.NewService(subRepo)
+
+	// Промокоды
+	promoCodeRepo := promocoderepo.NewPostgresPromoCodeRepository(database)
+	promoCodeService := promocodeservice.NewService(promoCodeRepo, userService, subService, database)
+	promoCodeHandler := promocodehttp.NewHandler(promoCodeService)
 
 	wsManager := binance_service.NewWebSocketManager(
 		context.Background(),
@@ -317,6 +325,13 @@ func main() {
 		// Payment routes
 		pr.Post("/api/payment/create", subHandler.CreatePayment)
 		pr.Post("/api/payment/webhook", subHandler.Webhook)
+
+		// Promo code routes
+		pr.Post("/api/promocode", promoCodeHandler.CreatePromoCode)
+		pr.Post("/api/promocode/apply", promoCodeHandler.ApplyPromoCode)
+		pr.Get("/api/promocodes", promoCodeHandler.GetAllPromoCodes)
+		pr.Get("/api/promocode/{id}", promoCodeHandler.GetPromoCode)
+		pr.Delete("/api/promocode/{id}", promoCodeHandler.DeletePromoCode)
 	})
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {

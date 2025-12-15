@@ -10,6 +10,8 @@ type SubscriptionRepository interface {
 	GetActiveByUserID(ctx context.Context, userID int64) (*subscription.Subscription, error)
 	CreatePending(ctx context.Context, userID int64, txID string) (*subscription.Subscription, error)
 	Activate(ctx context.Context, txID string) error
+	UpdateExpiresAt(ctx context.Context, userID int64, expiresAt time.Time) error
+	CreateActive(ctx context.Context, userID int64, expiresAt time.Time) error
 }
 
 type Service struct {
@@ -26,6 +28,25 @@ func (s *Service) IsUserSubscribed(ctx context.Context, userID int64) (bool, err
 		return false, err
 	}
 	return sub != nil, nil
+}
+
+func (s *Service) ExtendSubscription(ctx context.Context, userID int64, days int) error {
+	sub, err := s.repo.GetActiveByUserID(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	if sub == nil {
+		return s.CreateSubscription(ctx, userID, days)
+	}
+
+	newExpiresAt := sub.ExpiresAt.AddDate(0, 0, days)
+	return s.repo.UpdateExpiresAt(ctx, userID, newExpiresAt)
+}
+
+func (s *Service) CreateSubscription(ctx context.Context, userID int64, days int) error {
+	expiresAt := time.Now().AddDate(0, 0, days)
+	return s.repo.CreateActive(ctx, userID, expiresAt)
 }
 
 func (s *Service) CreatePayment(ctx context.Context, userID int64) (string, error) {

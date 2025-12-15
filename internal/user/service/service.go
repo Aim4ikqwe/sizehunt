@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 
-	"golang.org/x/crypto/bcrypt"
 	"sizehunt/internal/user"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 var (
@@ -16,6 +17,7 @@ var (
 type UserRepository interface {
 	Create(context.Context, *user.User) error
 	GetByEmail(context.Context, string) (*user.User, error)
+	GetByID(context.Context, int64) (*user.User, error)
 }
 
 type UserService struct {
@@ -45,6 +47,14 @@ func (s *UserService) Register(ctx context.Context, email, password string) (*us
 	}
 
 	return u, nil
+}
+
+func (s *UserService) IsAdmin(ctx context.Context, userID int64) (bool, error) {
+	u, err := s.repo.GetByID(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	return u.IsAdmin, nil
 }
 
 func (s *UserService) Login(ctx context.Context, email, password string) (*user.User, error) {
