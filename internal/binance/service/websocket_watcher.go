@@ -470,6 +470,8 @@ func (w *MarketDepthWatcher) monitorActivity() {
 }
 
 func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
+	// Время получения сообщения от WebSocket
+	receiveTime := time.Now()
 
 	symbol := data.Data.Symbol
 	binanceEventTime := time.UnixMilli(data.Data.EventTime)
@@ -479,6 +481,9 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 	if w.timeSyncService != nil {
 		binanceEventTime = w.timeSyncService.CorrectTimestamp(binanceEventTime)
 	}
+
+	// Вычисляем сетевую задержку (время от события на бирже до получения нами)
+	networkLatency := receiveTime.Sub(binanceEventTime)
 
 	w.mu.RLock()
 	// Проверяем, активен ли символ и есть ли сигналы
@@ -560,8 +565,10 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 				triggerTime := time.Now()
 				signal.TriggerTime = triggerTime
 				signal.BinanceEventTime = binanceEventTime
-				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel at %v (latency since event: %v, detection: %v)",
-					signal.ID, signal.TargetPrice, signal.LastQty, triggerTime, time.Since(binanceEventTime), detectDur)
+				// Вычисляем время обработки (время от начала обработки до срабатывания триггера)
+				processingTime := triggerTime.Sub(updateStart)
+				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f disappeared (was %.4f), triggering cancel at %v (network latency: %v, processing time: %v, total latency: %v, detection: %v)",
+					signal.ID, signal.TargetPrice, signal.LastQty, triggerTime, networkLatency, processingTime, triggerTime.Sub(binanceEventTime), detectDur)
 				order := &entity.Order{
 					Price:    signal.TargetPrice,
 					Quantity: signal.LastQty,
@@ -599,8 +606,10 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 				triggerTime := time.Now()
 				signal.TriggerTime = triggerTime
 				signal.BinanceEventTime = binanceEventTime
-				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat at %v (latency since event: %v, detection: %v)",
-					signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty, triggerTime, time.Since(binanceEventTime), detectDur)
+				// Вычисляем время обработки (время от начала обработки до срабатывания триггера)
+				processingTime := triggerTime.Sub(updateStart)
+				log.Printf("MarketDepthWatcher: Signal %d: Order at %.8f eaten by %.2f%% (%.4f -> %.4f), triggering eat at %v (network latency: %v, processing time: %v, total latency: %v, detection: %v)",
+					signal.ID, signal.TargetPrice, eatenPercentage*100, signal.OriginalQty, currentQty, triggerTime, networkLatency, processingTime, triggerTime.Sub(binanceEventTime), detectDur)
 				order := &entity.Order{
 					Price:    signal.TargetPrice,
 					Quantity: currentQty,

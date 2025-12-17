@@ -232,4 +232,3 @@ func (w *PositionWatcher) checkAndRemoveSignalsIfZeroPosition(symbol string) {
 		w.websocketMgr.GracefulStopProxyForUser(w.userID)
 	}
 }
-}
