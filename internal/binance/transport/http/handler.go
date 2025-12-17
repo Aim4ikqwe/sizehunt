@@ -409,30 +409,53 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		positionCheckDuration = time.Since(posStartTime)
 		if err != nil {
 			log.Printf("Handler: ERROR: Failed to check position for auto-close: %v (took %v)", err, positionCheckDuration)
-			http.Error(w, "failed to verify position", http.StatusInternalServerError)
-			return
-		}
-		if len(resp) == 0 {
-			log.Printf("Handler: ERROR: No position data returned for symbol %s", req.Symbol)
-			http.Error(w, "no position data available", http.StatusBadRequest)
-			return
-		}
 
-		positionAmtStr := resp[0].PositionAmt
-		positionAmt, err = strconv.ParseFloat(positionAmtStr, 64)
-		if err != nil {
-			log.Printf("Handler: ERROR: Failed to parse position amount %s: %v", positionAmtStr, err)
-			http.Error(w, "invalid position data", http.StatusBadRequest)
-			return
-		}
+			// Проверяем, является ли ошибка связанной с timestamp
+			if strings.Contains(err.Error(), "Timestamp for this request was") {
+				log.Printf("Handler: Timestamp error detected, attempting to sync time and retry")
 
-		log.Printf("Handler: Current position for %s: %s (%.6f)", req.Symbol, positionAmtStr, positionAmt)
+				// Создаем временный клиент с синхронизацией времени
+				tempFuturesClient := futures.NewClient(apiKey, secretKey)
+				timeSyncService := service.NewTimeSyncService(tempFuturesClient)
+				timeSyncService.SyncTime()
 
-		// Если позиция нулевая, не создаем сигнал с auto-close
-		if positionAmt == 0 {
-			log.Printf("Handler: ERROR: Cannot create auto-close signal: position is zero for %s", req.Symbol)
-			http.Error(w, "cannot create auto-close signal: position is zero", http.StatusBadRequest)
-			return
+				// Повторная попытка проверки позиции с синхронизированным временем
+				resp, err = tempFuturesClient.NewGetPositionRiskService().Symbol(req.Symbol).Do(r.Context())
+				if err != nil {
+					log.Printf("Handler: ERROR: Position check failed again after time sync: %v", err)
+					http.Error(w, "failed to verify position even after time sync", http.StatusInternalServerError)
+					return
+				}
+			} else {
+				http.Error(w, "failed to verify position", http.StatusInternalServerError)
+				return
+			}
+
+			if len(resp) == 0 {
+				log.Printf("Handler: ERROR: No position data returned for symbol %s", req.Symbol)
+				http.Error(w, "no position data available", http.StatusBadRequest)
+				return
+			}
+
+			positionAmtStr := resp[0].PositionAmt
+			positionAmt, err = strconv.ParseFloat(positionAmtStr, 64)
+			if err != nil {
+				log.Printf("Handler: ERROR: Failed to parse position amount %s: %v", positionAmtStr, err)
+				http.Error(w, "invalid position data", http.StatusBadRequest)
+				return
+			}
+
+			log.Printf("Handler: Current position for %s: %s (%.6f)", req.Symbol, positionAmtStr, positionAmt)
+
+			// If позиция нулевая, не создаем сигнал с auto-close
+			if positionAmt == 0 {
+				log.Printf("Handler: ERROR: Cannot create auto-close signal: position is zero for %s", req.Symbol)
+				http.Error(w, "cannot create auto-close signal: position is zero", http.StatusBadRequest)
+				return
+			}
+
+			log.Printf("Handler: Position for %s is %.6f, allowing auto-close signal (check took %v)",
+				req.Symbol, positionAmt, positionCheckDuration)
 		}
 
 		log.Printf("Handler: Position for %s is %.6f, allowing auto-close signal (check took %v)",
