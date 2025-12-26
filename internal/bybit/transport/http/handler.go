@@ -226,7 +226,7 @@ func (h *Handler) DeleteKeys(w http.ResponseWriter, r *http.Request) {
 // CreateSignalRequest структура запроса для создания сигнала Bybit
 type CreateSignalRequest struct {
 	Symbol          string  `json:"symbol" validate:"required"`
-	Category        string  `json:"category" validate:"required,oneof=spot linear inverse"`
+	WatchCategory   string  `json:"watch_category" validate:"required,oneof=spot linear inverse"` // за чем следить
 	TargetPrice     float64 `json:"target_price" validate:"required,gt=0"`
 	MinQuantity     float64 `json:"min_quantity" validate:"required,gt=0"`
 	TriggerOnCancel bool    `json:"trigger_on_cancel"`
@@ -369,14 +369,13 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Bybit API temporarily unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		if req.Category == "spot" {
-			http.Error(w, "AutoClose is not supported for spot market, only for linear/inverse", http.StatusBadRequest)
-			return
-		}
+		// AutoClose всегда закрывает позицию на linear (фьючерс)
+		// Проверяем позицию на linear независимо от watch_category
 
 		proxyAddr, _ := h.ProxyService.GetProxyAddressForUser(userID)
 		tempClient := service.NewBybitHTTPClientWithProxy(apiKey, secretKey, proxyAddr)
-		posResp, err := tempClient.GetPositionRisk(req.Symbol, req.Category)
+		// Проверяем позицию на linear (закрытие всегда на фьючерсе)
+		posResp, err := tempClient.GetPositionRisk(req.Symbol, "linear")
 		if err != nil {
 			log.Printf("BybitHandler: ERROR: Failed to check position: %v", err)
 			http.Error(w, "failed to verify position", http.StatusInternalServerError)
@@ -392,10 +391,10 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		log.Printf("BybitHandler: Position for %s is %.6f, allowing auto-close signal", req.Symbol, positionAmt)
 	}
 
-	// Получение ордербука
+	// Получение ордербука на выбранной пользователем категории (watch_category)
 	proxyAddr, _ := h.ProxyService.GetProxyAddressForUser(userID)
 	client := service.NewBybitHTTPClientWithProxy(apiKey, secretKey, proxyAddr)
-	ob, err := client.GetOrderBook(req.Symbol, 500, req.Category)
+	ob, err := client.GetOrderBook(req.Symbol, 500, req.WatchCategory)
 	if err != nil {
 		log.Printf("BybitHandler: ERROR: GetOrderBook failed: %v", err)
 		http.Error(w, fmt.Sprintf("failed to fetch order book: %v", err), http.StatusInternalServerError)
@@ -410,18 +409,16 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Определяем категории для мониторинга и закрытия
-	watchCategory := req.Category
-	closeCategory := req.Category
-	if req.Category == "spot" {
-		// Для spot мониторим spot, но закрывать будем на linear
-		closeCategory = "linear"
-	}
+	// watch_category - выбор пользователя (spot или linear)
+	// close_category - всегда linear (закрытие позиций только на фьючерсе)
+	watchCategory := req.WatchCategory
+	closeCategory := "linear" // Закрытие позиции всегда на фьючерсе
 
 	// Создание сигнала в БД
 	signalDB := &repository.SignalDB{
 		UserID:          userID,
 		Symbol:          req.Symbol,
-		Category:        req.Category,
+		Category:        req.WatchCategory, // основная категория = watch_category
 		TargetPrice:     req.TargetPrice,
 		MinQuantity:     req.MinQuantity,
 		TriggerOnCancel: req.TriggerOnCancel,
@@ -444,8 +441,8 @@ func (h *Handler) CreateSignal(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("BybitHandler: Signal saved to database with ID %d", signalDB.ID)
 
-	// Получение watcher'а
-	watcher, err := h.WebSocketManager.GetOrCreateWatcherForUser(userID, req.Symbol, req.Category, req.AutoClose)
+	// Получение watcher'а (используем watch_category для подключения к нужному WebSocket)
+	watcher, err := h.WebSocketManager.GetOrCreateWatcherForUser(userID, req.Symbol, req.WatchCategory, req.AutoClose)
 	if err != nil {
 		if delErr := h.SignalRepository.Delete(r.Context(), signalDB.ID); delErr != nil {
 			log.Printf("BybitHandler: ERROR: Failed to clean up signal %d: %v", signalDB.ID, delErr)
