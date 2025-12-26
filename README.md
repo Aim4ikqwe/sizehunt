@@ -58,7 +58,7 @@ SizeHunt - это мощное backend-приложение, разработа�
 
 1. Клонируйте репозиторий:
    ```bash
-   git clone <ваш_репозиторий>
+   git clone https://github.com/Aim4ikqwe/sizehunt
    cd sizehunt
    ```
 
