@@ -27,6 +27,9 @@ import (
 	"sizehunt/internal/binance/repository"
 	binance_service "sizehunt/internal/binance/service"
 	binancehttp "sizehunt/internal/binance/transport/http"
+	bybit_repository "sizehunt/internal/bybit/repository"
+	bybit_service "sizehunt/internal/bybit/service"
+	bybithttp "sizehunt/internal/bybit/transport/http"
 	"sizehunt/internal/config"
 	okx_repository "sizehunt/internal/okx/repository"
 	okx_service "sizehunt/internal/okx/service"
@@ -235,6 +238,39 @@ func main() {
 
 	okxHandler := okxhttp.NewOKXHandler(okxWatcher, okxKeysRepo, cfg, okxWSManager, subService, server, okxSignalRepo, proxyService)
 
+	// Bybit
+	bybitKeysRepo := bybit_repository.NewPostgresKeysRepo(database)
+	bybitSignalRepo := bybit_repository.NewPostgresSignalRepo(dbx)
+	bybitClient := bybit_service.NewBybitHTTPClient("", "") // Инициализируем без ключей
+	bybitWatcher := bybit_service.NewWatcher(bybitClient)
+
+	// Регистрируем чекер сигналов Bybit для прокси
+	proxyService.RegisterSignalChecker(func(ctx context.Context, userID int64) (bool, error) {
+		signals, err := bybitSignalRepo.GetActiveByUserID(ctx, userID)
+		if err != nil {
+			return false, err
+		}
+		return len(signals) > 0, nil
+	})
+
+	bybitWSManager := bybit_service.NewWebSocketManager(
+		context.Background(),
+		subService,
+		bybitKeysRepo,
+		bybitSignalRepo,
+		cfg,
+		proxyService,
+	)
+	go bybitWSManager.StartConnectionMonitor()
+	log.Println("Loading Bybit active signals from database...")
+	if err := bybitWSManager.LoadActiveSignals(); err != nil {
+		log.Printf("Failed to load Bybit active signals: %v", err)
+	} else {
+		log.Println("Bybit active signals loaded successfully")
+	}
+
+	bybitHandler := bybithttp.NewBybitHandler(bybitWatcher, bybitKeysRepo, cfg, bybitWSManager, subService, server, bybitSignalRepo, proxyService)
+
 	// --- РОУТЕР ---
 	r := chi.NewRouter()
 
@@ -321,6 +357,16 @@ func main() {
 		pr.Get("/api/okx/signals", okxHandler.GetSignals)
 		pr.Delete("/api/okx/signals/{id}", okxHandler.DeleteSignal)
 		pr.Get("/api/okx/keys/status", okxHandler.GetKeysStatus)
+
+		// Bybit routes
+		pr.Get("/api/bybit/book", bybitHandler.GetOrderBook)
+		pr.Get("/api/bybit/order-at-price", bybitHandler.GetOrderAtPrice)
+		pr.Post("/api/bybit/keys", bybitHandler.SaveKeys)
+		pr.Delete("/api/bybit/keys", bybitHandler.DeleteKeys)
+		pr.Post("/api/bybit/signal", bybitHandler.CreateSignal)
+		pr.Get("/api/bybit/signals", bybitHandler.GetSignals)
+		pr.Delete("/api/bybit/signals/{id}", bybitHandler.DeleteSignal)
+		pr.Get("/api/bybit/keys/status", bybitHandler.GetKeysStatus)
 
 		// Payment routes
 		pr.Post("/api/payment/create", subHandler.CreatePayment)
