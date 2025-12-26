@@ -44,6 +44,7 @@ type PositionWatcher struct {
 	wsManager        *WebSocketManager
 	userID           int64
 	onPositionUpdate func(symbol string, pos *Position)
+	httpClient       *BybitHTTPClient // HTTP клиент для загрузки начальных позиций
 }
 
 // NewPositionWatcher создает новый PositionWatcher
@@ -73,13 +74,14 @@ func (pw *PositionWatcher) SetUserID(userID int64) {
 }
 
 // Start запускает PositionWatcher
-func (pw *PositionWatcher) Start(proxyAddr string) error {
+func (pw *PositionWatcher) Start(proxyAddr string, httpClient *BybitHTTPClient) error {
 	pw.mu.Lock()
 	if pw.isRunning {
 		pw.mu.Unlock()
 		return nil
 	}
 	pw.proxyAddr = proxyAddr
+	pw.httpClient = httpClient
 	pw.mu.Unlock()
 
 	if err := pw.connect(); err != nil {
@@ -94,7 +96,58 @@ func (pw *PositionWatcher) Start(proxyAddr string) error {
 	pw.mu.Unlock()
 
 	log.Printf("BybitPositionWatcher: Started for user %d", pw.userID)
+
+	// Загружаем начальные позиции через REST API
+	go pw.loadInitialPositions()
+
 	return nil
+}
+
+// loadInitialPositions загружает начальные позиции через REST API
+func (pw *PositionWatcher) loadInitialPositions() {
+	pw.mu.RLock()
+	client := pw.httpClient
+	pw.mu.RUnlock()
+
+	if client == nil {
+		log.Printf("BybitPositionWatcher: No HTTP client, skipping initial position load")
+		return
+	}
+
+	// Загружаем все linear позиции
+	posResp, err := client.GetPositionRisk("", "linear")
+	if err != nil {
+		log.Printf("BybitPositionWatcher: Failed to load initial positions: %v", err)
+		return
+	}
+
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+
+	for _, p := range posResp.Result.List {
+		size, _ := strconv.ParseFloat(p.Size, 64)
+		if size == 0 {
+			continue // Пропускаем пустые позиции
+		}
+
+		avgPrice, _ := strconv.ParseFloat(p.AvgPrice, 64)
+		uPnl, _ := strconv.ParseFloat(p.UnrealisedPnl, 64)
+
+		pos := &Position{
+			Symbol:         p.Symbol,
+			Side:           p.Side,
+			Size:           size,
+			AvgPrice:       avgPrice,
+			UnrealisedPnl:  uPnl,
+			Category:       "linear",
+			PositionStatus: p.PositionStatus,
+		}
+
+		pw.positions[p.Symbol] = pos
+		log.Printf("BybitPositionWatcher: Loaded initial position for %s: size=%.6f, side=%s", p.Symbol, size, p.Side)
+	}
+
+	log.Printf("BybitPositionWatcher: Loaded %d initial positions", len(pw.positions))
 }
 
 // connect подключается к приватному WebSocket Bybit

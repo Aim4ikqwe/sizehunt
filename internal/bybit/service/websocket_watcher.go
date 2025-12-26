@@ -63,6 +63,7 @@ type MarketDepthWatcher struct {
 	WebSocketManager    *WebSocketManager
 	UserID              int64
 	positionWatcher     *PositionWatcher
+	pendingAutoCloseOps int32 // счётчик активных auto-close операций
 }
 
 // NewMarketDepthWatcher создает новый MarketDepthWatcher для Bybit
@@ -224,8 +225,14 @@ func (w *MarketDepthWatcher) removeSignalByIDLocked(id int64) {
 	log.Printf("BybitMarketDepthWatcher: WARNING: Signal %d not found for removal", id)
 }
 
-// checkAndStopPositionWatcher останавливает PositionWatcher если нет auto-close сигналов
+// checkAndStopPositionWatcher останавливает PositionWatcher если нет auto-close сигналов И нет активных операций
 func (w *MarketDepthWatcher) checkAndStopPositionWatcher() {
+	// Не останавливаем, если есть активные auto-close операции
+	if w.pendingAutoCloseOps > 0 {
+		log.Printf("BybitMarketDepthWatcher: %d pending auto-close operations, keeping PositionWatcher alive", w.pendingAutoCloseOps)
+		return
+	}
+
 	hasAutoClose := false
 	for _, signals := range w.signalsBySymbol {
 		for _, signal := range signals {
@@ -439,7 +446,19 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *BybitDepthStreamData) {
 						}
 					}
 
+					// Увеличиваем счётчик активных операций
+					w.pendingAutoCloseOps++
+					log.Printf("BybitMarketDepthWatcher: Started auto-close operation, pending ops: %d", w.pendingAutoCloseOps)
+
 					go func() {
+						defer func() {
+							w.mu.Lock()
+							w.pendingAutoCloseOps--
+							log.Printf("BybitMarketDepthWatcher: Completed auto-close operation, pending ops: %d", w.pendingAutoCloseOps)
+							// Проверяем нужно ли остановить PositionWatcher после завершения
+							w.checkAndStopPositionWatcher()
+							w.mu.Unlock()
+						}()
 						w.handleAutoClose(&sigCopy, &orderCopy, cachedPos)
 					}()
 				}
@@ -482,7 +501,18 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *BybitDepthStreamData) {
 						}
 					}
 
+					// Увеличиваем счётчик активных операций
+					w.pendingAutoCloseOps++
+					log.Printf("BybitMarketDepthWatcher: Started auto-close operation, pending ops: %d", w.pendingAutoCloseOps)
+
 					go func() {
+						defer func() {
+							w.mu.Lock()
+							w.pendingAutoCloseOps--
+							log.Printf("BybitMarketDepthWatcher: Completed auto-close operation, pending ops: %d", w.pendingAutoCloseOps)
+							w.checkAndStopPositionWatcher()
+							w.mu.Unlock()
+						}()
 						w.handleAutoClose(&sigCopy, &orderCopy, cachedPos)
 					}()
 				}

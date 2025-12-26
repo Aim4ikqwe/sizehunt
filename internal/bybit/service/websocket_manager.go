@@ -153,8 +153,9 @@ func (m *WebSocketManager) GetOrCreateWatcherForUser(userID int64, symbol, categ
 			positionWatcher.SetWebSocketManager(m)
 			positionWatcher.SetUserID(userID)
 
+			clientCopy := httpClient // сохраняем для замыкания
 			go func() {
-				if err := positionWatcher.Start(proxyAddr); err != nil {
+				if err := positionWatcher.Start(proxyAddr, clientCopy); err != nil {
 					log.Printf("BybitWebSocketManager: ERROR: Failed to start PositionWatcher for user %d: %v", userID, err)
 				} else {
 					log.Printf("BybitWebSocketManager: PositionWatcher started for user %d", userID)
@@ -209,8 +210,9 @@ func (m *WebSocketManager) ensurePositionWatcher(userWatcher *UserWatcher, userI
 		userWatcher.watcher.positionWatcher = positionWatcher
 	}
 
+	httpClientCopy := userWatcher.httpClient // сохраняем для замыкания
 	go func() {
-		if err := positionWatcher.Start(proxyAddr); err != nil {
+		if err := positionWatcher.Start(proxyAddr, httpClientCopy); err != nil {
 			log.Printf("BybitWebSocketManager: ERROR: Failed to start PositionWatcher for user %d: %v", userID, err)
 		} else {
 			log.Printf("BybitWebSocketManager: PositionWatcher started for user %d (auto-close needed)", userID)

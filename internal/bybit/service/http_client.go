@@ -296,10 +296,17 @@ func (c *BybitHTTPClient) Ping() error {
 }
 
 // GetPositionRisk получает информацию о позиции
+// Если symbol пустой, возвращает все позиции для settleCoin=USDT
 func (c *BybitHTTPClient) GetPositionRisk(symbol, category string) (*BybitPositionResponse, error) {
 	params := map[string]string{
 		"category": category,
-		"symbol":   symbol,
+	}
+
+	// Если symbol не указан, используем settleCoin для получения всех позиций
+	if symbol != "" {
+		params["symbol"] = symbol
+	} else {
+		params["settleCoin"] = "USDT" // Получаем все USDT-M позиции
 	}
 
 	path := BybitAPIVersion + "/position/list"
