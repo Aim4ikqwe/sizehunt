@@ -4,6 +4,7 @@ package service
 import (
 	"context"
 	"os"
+	"sync/atomic"
 
 	"log"
 	"runtime"
@@ -73,6 +74,7 @@ type MarketDepthWatcher struct {
 	WebSocketManager    *WebSocketManager
 	UserID              int64
 	timeSyncService     *TimeSyncService // сервис синхронизации времени
+	pendingAutoCloseOps int32            // количество активных асинхронных операций закрытия
 }
 
 func NewMarketDepthWatcher(
@@ -655,27 +657,6 @@ func (w *MarketDepthWatcher) processDepthUpdate(data *UnifiedDepthStreamData) {
 		log.Printf("MarketDepthWatcher: Removing triggered signal %d immediately after trigger", id)
 		w.removeSignalByIDLocked(id)
 	}
-
-	// Проверяем, остались ли у пользователя активные сигналы после срабатывания триггера
-	// Изменяем часть кода в конце метода, где обрабатываем сработавшие сигналы
-	if len(signalsToRemove) > 0 {
-		// 1. Сначала выполняем все операции auto-close
-		autoCloseDone := make(chan struct{})
-		go func() {
-			defer close(autoCloseDone)
-			time.Sleep(2000 * time.Millisecond) // Даем время на все асинхронные операции закрытия позиции
-		}()
-
-		// 2. Ждем завершения операций auto-close перед удалением сигналов
-		<-autoCloseDone
-
-		// 3. Только потом удаляем сигналы
-		for _, id := range signalsToRemove {
-			log.Printf("MarketDepthWatcher: Removing triggered signal %d after auto-close operations", id)
-			w.removeSignalByIDLocked(id)
-		}
-	}
-
 }
 
 // 🔥 НОВЫЙ МЕТОД: удаление сигнала по ID с полной очисткой ресурсов
@@ -742,11 +723,21 @@ func (w *MarketDepthWatcher) findOrderAtPrice(ob *OrderBookMap, targetPrice floa
 }
 
 func (w *MarketDepthWatcher) handleAutoClose(signal *Signal, order *entity.Order) {
+	atomic.AddInt32(&w.pendingAutoCloseOps, 1)
+	pending := atomic.LoadInt32(&w.pendingAutoCloseOps)
+	log.Printf("MarketDepthWatcher: Started auto-close operation, pending ops: %d", pending)
+
 	startTime := time.Now()
 	log.Printf("MarketDepthWatcher: Starting handleAutoClose for signal %d at %v", signal.ID, startTime)
 	defer func() {
+		atomic.AddInt32(&w.pendingAutoCloseOps, -1)
 		log.Printf("MarketDepthWatcher: handleAutoClose for signal %d completed (total time: %v)",
 			signal.ID, time.Since(startTime))
+
+		// После завершения пробуем проверить, не пора ли закрыть ресурсы
+		if w.WebSocketManager != nil {
+			w.WebSocketManager.CheckAndStopUserDataStream(w.UserID)
+		}
 	}()
 
 	// Для спота с auto-close всегда используем фьючерсы для закрытия позиции

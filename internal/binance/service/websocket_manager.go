@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adshao/go-binance/v2/futures"
@@ -749,22 +750,29 @@ func (m *WebSocketManager) CheckAndStopUserDataStream(userID int64) {
 	uw.mu.Lock()
 	defer uw.mu.Unlock()
 
-	// Проверяем, есть ли еще активные сигналы с autoClose
+	// Проверяем, есть ли еще активные сигналы с autoClose или выполняющиеся операции
 	hasActiveAutoClose := false
 
-	// Проверяем все сигналы во всех watcher'ах
-	for _, watcher := range uw.futuresWatchers {
-		signals := watcher.GetAllSignals()
-		for _, signal := range signals {
-			if signal.AutoClose {
-				log.Printf("WebSocketManager: Found active auto-close signal %d for user %d", signal.ID, userID)
-				hasActiveAutoClose = true
-				break
+	// Проверяем все сигналы и операции во всех watcher'ах (спот и фьючерс)
+	checkWatchers := func(watchers map[string]*MarketDepthWatcher) bool {
+		for _, watcher := range watchers {
+			if atomic.LoadInt32(&watcher.pendingAutoCloseOps) > 0 {
+				log.Printf("WebSocketManager: Found pending auto-close operations in watcher for user %d", userID)
+				return true
+			}
+			signals := watcher.GetAllSignals()
+			for _, signal := range signals {
+				if signal.AutoClose {
+					log.Printf("WebSocketManager: Found active auto-close signal %d for user %d", signal.ID, userID)
+					return true
+				}
 			}
 		}
-		if hasActiveAutoClose {
-			break
-		}
+		return false
+	}
+
+	if checkWatchers(uw.spotWatchers) || checkWatchers(uw.futuresWatchers) {
+		hasActiveAutoClose = true
 	}
 
 	// Если нет активных сигналов с autoClose и есть userDataStream, останавливаем его
