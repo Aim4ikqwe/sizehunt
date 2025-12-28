@@ -1,4 +1,7 @@
 // cmd/server/main.go
+// TODO протестировать всё
+// TODO добавить возможность пользователью выбрать  автоматическое снятие заявок после закрытия позиции
+// TODO добавить возможность пользователю выбрать автоматическую проверку если цена ушла за дальность сигнала, то не закрывать позицию, а дождаться пока цена вернётся в область сигнала
 package main
 
 import (
@@ -369,6 +372,7 @@ func main() {
 		pr.Get("/api/bybit/keys/status", bybitHandler.GetKeysStatus)
 
 		// Payment routes
+		pr.Get("/api/subscription/info", subHandler.GetSubscription)
 		pr.Post("/api/payment/create", subHandler.CreatePayment)
 		pr.Post("/api/payment/webhook", subHandler.Webhook)
 

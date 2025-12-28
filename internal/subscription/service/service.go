@@ -64,3 +64,7 @@ func (s *Service) CreatePayment(ctx context.Context, userID int64) (string, erro
 func (s *Service) HandlePaymentWebhook(ctx context.Context, txID string) error {
 	return s.repo.Activate(ctx, txID)
 }
+
+func (s *Service) GetSubscription(ctx context.Context, userID int64) (*subscription.Subscription, error) {
+	return s.repo.GetActiveByUserID(ctx, userID)
+}

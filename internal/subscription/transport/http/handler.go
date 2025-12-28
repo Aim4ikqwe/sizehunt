@@ -55,3 +55,30 @@ func (h *Handler) Webhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }
+
+func (h *Handler) GetSubscription(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	userID := ctx.Value(middleware.UserIDKey).(int64)
+
+	sub, err := h.SubscriptionService.GetSubscription(ctx, userID)
+	if err != nil {
+		http.Error(w, "failed to get subscription", http.StatusInternalServerError)
+		return
+	}
+
+	if sub == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "none",
+		})
+		return
+	}
+
+	resp := map[string]interface{}{
+		"status":     sub.Status,
+		"expires_at": sub.ExpiresAt,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
