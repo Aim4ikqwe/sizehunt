@@ -288,6 +288,7 @@ func main() {
 	}))
 	r.Use(middleware.MetricsMiddleware)
 	r.Use(middleware.ValidateRequest)
+	r.Use(middleware.GlobalRateLimiter.Middleware)
 
 	// Публичные роуты
 	r.Post("/auth/register", h.Register)
@@ -330,6 +331,7 @@ func main() {
 	// 🔐 Защищённая группа маршрутов
 	r.Group(func(pr chi.Router) {
 		pr.Use(middleware.JWTAuth(cfg.JWTSecret))
+		pr.Use(middleware.DBRlsMiddleware(database))
 		pr.Get("/auth/me", func(w http.ResponseWriter, r *http.Request) {
 			id := r.Context().Value(middleware.UserIDKey).(int64)
 			w.Write([]byte(fmt.Sprintf("Your user ID: %d", id)))

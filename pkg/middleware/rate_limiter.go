@@ -3,6 +3,7 @@ package middleware
 import (
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -70,7 +71,21 @@ func (r *RateLimiter) Allow(ip string) bool {
 
 func (r *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		ip := req.RemoteAddr
+		ip := req.Header.Get("X-Forwarded-For")
+		if ip == "" {
+			ip = req.RemoteAddr
+		} else {
+			// X-Forwarded-For может содержать список IP, берем первый
+			ips := strings.Split(ip, ",")
+			ip = strings.TrimSpace(ips[0])
+		}
+
+		// Убираем порт, если он есть
+		if strings.Contains(ip, ":") {
+			parts := strings.Split(ip, ":")
+			ip = parts[0]
+		}
+
 		if !r.Allow(ip) {
 			http.Error(w, "Too many requests", http.StatusTooManyRequests)
 			log.Printf("Rate limit exceeded for IP: %s", ip)

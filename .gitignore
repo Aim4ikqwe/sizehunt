@@ -1,0 +1,8 @@
+.env
+*.exe
+vendor/
+.idea/
+bin/
+/quantity
+/2
+/dist/
